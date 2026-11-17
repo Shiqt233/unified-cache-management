@@ -154,6 +154,11 @@ Status LoadTransportConfig(const std::string& configPath, TransportConfig& confi
             continue;
         } else if (ApplyTransportDeviceConfigField(config, key, value)) {
             continue;
+        } else if (const auto status = ApplyTransportRetryConfigField(config, key, value);
+                   status.ok()) {
+            continue;
+        } else if (status.code != StatusCode::UNSUPPORTED) {
+            return status;
         } else {
             config.attrs[key] = value;
         }

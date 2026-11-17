@@ -25,6 +25,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -45,6 +46,22 @@ struct BatchView {
     bool empty() const noexcept { return size == 0; }
 };
 
+enum class NodeHealth : std::uint8_t {
+    GREEN,
+    YELLOW,
+    RED,
+};
+
+struct NodeHealthSnapshot {
+    NodeHealth health{NodeHealth::GREEN};
+    std::uint32_t activeCount{0};
+    std::uint32_t drainingCount{0};
+    std::uint32_t reconnectingCount{0};
+    std::uint32_t failedCount{0};
+    std::uint64_t generation{0};
+    std::chrono::steady_clock::time_point nextRetryAt{std::chrono::steady_clock::time_point::max()};
+};
+
 class AsuTransport {
 public:
     virtual ~AsuTransport() = default;
@@ -55,11 +72,18 @@ public:
                         std::shared_ptr<TransProvider> transProvider) = 0;
     virtual Status Shutdown() = 0;
     virtual Status CheckHealth() = 0;
+    // Optional read-only QP health snapshot. Stub transports may keep the default.
+    virtual Status GetConnectionHealth(NodeHealthSnapshot&) {
+        return Status::Error(StatusCode::UNSUPPORTED, "connection health snapshot is not supported");
+    }
 
     virtual Status Submit(const std::shared_ptr<TransportTask>& task) = 0;
 
     // Best-effort cancellation, does not interrupt underlying UB/RoCE IO
     virtual Status Cancel(TaskId taskId) = 0;
+
+    // Optional read-only memory-inflight query used before physical MR unregistration.
+    virtual bool HasInflightMemory(MRHandle) { return false; }
 };
 
 std::unique_ptr<AsuTransport> CreateAsuTransport();

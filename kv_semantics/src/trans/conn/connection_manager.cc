@@ -37,6 +37,65 @@ ConnectionManager::ConnectionManager(TransProvider& provider, const std::string&
 
 ConnectionManager::~ConnectionManager() { Shutdown(); }
 
+void ConnectionManager::ConfigureRecovery(std::uint32_t retryPerRound, std::uint64_t initialBackoffMs,
+                                          std::uint64_t maxBackoffMs)
+{
+    connectRetryPerRound_ = retryPerRound;
+    recoverInitialBackoffMs_ = initialBackoffMs;
+    recoverMaxBackoffMs_ = maxBackoffMs;
+    std::lock_guard<std::mutex> lock(recoverStateMu_);
+    recoverStates_.clear();
+}
+
+Status ConnectionManager::CreateConnectionWithRetry(const NodeEndpoint& endpoint, std::uint32_t qpNum,
+                                                    std::uint64_t initialBackoffMs,
+                                                    std::vector<ConnectionHandle>& handles)
+{
+    Status lastStatus = Status::OK();
+    auto backoffMs = initialBackoffMs;
+    for (std::uint32_t attempt = 0; attempt <= connectRetryPerRound_; ++attempt) {
+        handles.clear();
+        lastStatus = provider_.CreateConnection(localIp_, endpoint.ip, endpoint.port, qpNum, timeout_,
+                                                handles);
+        if (lastStatus.ok() && !handles.empty()) { return lastStatus; }
+        if (lastStatus.ok()) {
+            lastStatus = Status::Error(StatusCode::INTERNAL_ERROR,
+                                       "provider returned no connection handles");
+        }
+        if (attempt < connectRetryPerRound_) {
+            if (backoffMs != 0) { std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs)); }
+            backoffMs = backoffMs > recoverMaxBackoffMs_ / 2 ? recoverMaxBackoffMs_ : backoffMs * 2;
+        }
+    }
+    return lastStatus;
+}
+
+ConnectionManager::RecoverState ConnectionManager::GetRecoverState(
+    const std::shared_ptr<ConnectionChannel>& channel)
+{
+    std::lock_guard<std::mutex> lock(recoverStateMu_);
+    const auto iter = recoverStates_.find(channel.get());
+    return iter == recoverStates_.end() ? RecoverState{recoverInitialBackoffMs_,
+                                                       std::chrono::steady_clock::time_point::min()}
+                                        : iter->second;
+}
+
+void ConnectionManager::ScheduleRecoverFailure(const std::shared_ptr<ConnectionChannel>& channel,
+                                               RecoverState state)
+{
+    state.nextRetryAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(state.backoffMs);
+    state.backoffMs = state.backoffMs > recoverMaxBackoffMs_ / 2 ? recoverMaxBackoffMs_
+                                                                 : state.backoffMs * 2;
+    std::lock_guard<std::mutex> lock(recoverStateMu_);
+    recoverStates_[channel.get()] = state;
+}
+
+void ConnectionManager::ResetRecoverState(const std::shared_ptr<ConnectionChannel>& channel)
+{
+    std::lock_guard<std::mutex> lock(recoverStateMu_);
+    recoverStates_.erase(channel.get());
+}
+
 Status ConnectionManager::AddGroup(const NodeEndpoint& endpoint, std::uint32_t qp_num)
 {
     if (shuttingDown_.load(std::memory_order_acquire)) {
@@ -45,8 +104,7 @@ Status ConnectionManager::AddGroup(const NodeEndpoint& endpoint, std::uint32_t q
     KV_DEBUG("ConnectionManager::AddGroup endpoint={} qp_num={}", endpoint.ip, qp_num);
 
     std::vector<TransProvider::ConnectionHandle> handles;
-    auto createStatus =
-        provider_.CreateConnection(localIp_, endpoint.ip, endpoint.port, qp_num, timeout_, handles);
+    auto createStatus = CreateConnectionWithRetry(endpoint, qp_num, recoverInitialBackoffMs_, handles);
     if (!createStatus.ok()) { return createStatus; }
     if (handles.empty()) {
         return Status::Error(StatusCode::INTERNAL_ERROR, "provider returned no connection handles");
@@ -80,8 +138,14 @@ Status ConnectionManager::AddGroup(const NodeEndpoint& endpoint, std::uint32_t q
         std::lock_guard<std::mutex> cacheLock(channelCacheMu_);
         std::unique_lock<std::shared_mutex> lock(structureMu_);
         auto gid = static_cast<std::uint32_t>(groups_.size());
-        auto group = std::make_unique<ConnectionGroup>(gid, endpoint, capabilities);
+        auto group = std::make_shared<ConnectionGroup>(gid, endpoint, capabilities);
         for (auto handle : handles) { group->AddChannel(handle, &provider_); }
+        const auto effectiveMax = capabilities.ioQueueDepth != 0
+                                      ? std::min(maxInflightPerChannel_, capabilities.ioQueueDepth)
+                                      : maxInflightPerChannel_;
+        group->ConfigureFlow(static_cast<std::uint64_t>(qp_num) * effectiveMax,
+                             static_cast<std::uint64_t>(qp_num) * busyFloor_, flowControlEnabled_,
+                             stableSuccessMs_, effectiveMax);
         groups_.push_back(std::move(group));
 
         for (const auto& channel : groups_.back()->GetChannels()) {
@@ -110,6 +174,10 @@ Status ConnectionManager::Shutdown()
         std::unique_lock<std::shared_mutex> lock(structureMu_);
         groups_.clear();
     }
+    {
+        std::lock_guard<std::mutex> lock(recoverStateMu_);
+        recoverStates_.clear();
+    }
 
     KV_DEBUG("ConnectionManager::Shutdown done");
     return Status::OK();
@@ -117,20 +185,123 @@ Status ConnectionManager::Shutdown()
 
 std::shared_ptr<ConnectionChannel> ConnectionManager::SelectConnection()
 {
-    if (shuttingDown_.load(std::memory_order_acquire)) { return nullptr; }
-    auto policy = routingPolicy_;
-    auto channel =
-        policy == RoutingPolicy::LEAST_LOADED ? SelectByLeastLoaded() : SelectByRoundRobin();
-    if (channel) {
-        KV_DEBUG("ConnectionManager::SelectConnection policy={} ch_id={} group_id={} inflight={}",
-                 policy == RoutingPolicy::LEAST_LOADED ? "LEAST_LOADED" : "ROUND_ROBIN",
-                 channel->GetChannelId(), channel->GetGroup()->GetGroupId(),
-                 channel->GetInflightCount());
-    } else {
-        KV_DEBUG("ConnectionManager::SelectConnection policy={} NO available channel",
-                 policy == RoutingPolicy::LEAST_LOADED ? "LEAST_LOADED" : "ROUND_ROBIN");
+    return SelectConnection(std::set<ConnectionAttemptKey>{});
+}
+
+std::shared_ptr<ConnectionChannel> ConnectionManager::SelectConnection(
+    const std::set<ConnectionAttemptKey>& excludedGenerations)
+{
+    ConnectionRequest request;
+    request.excludedGenerations = excludedGenerations;
+    auto result = TryAcquire(request);
+    return result.ok() ? result.channel : nullptr;
+}
+
+std::shared_ptr<ConnectionChannel> ConnectionManager::SelectConnection(
+    const std::set<const ConnectionChannel*>& excludedChannels)
+{
+    std::set<ConnectionAttemptKey> excluded;
+    for (const auto* channel : excludedChannels) {
+        if (channel != nullptr) { excluded.insert(MakeAttemptKey(*channel)); }
     }
-    return channel;
+    return SelectConnection(excluded);
+}
+
+AcquireResult ConnectionManager::TryAcquire(const ConnectionRequest& request)
+{
+    AcquireResult result;
+    if (shuttingDown_.load(std::memory_order_acquire)) { return result; }
+
+    const auto& preferred = request.preferredChannel;
+    if (preferred == nullptr && request.probe) {
+        result.status = Status::Error(StatusCode::CONNECTION_ERROR, "probe target is not specified");
+        return result;
+    }
+    if (preferred != nullptr &&
+        request.targetGeneration != 0 && preferred->GetGeneration() != request.targetGeneration) {
+        result.channel = preferred;
+        result.group = preferred->GetGroupLease();
+        result.generation = preferred->GetGeneration();
+        result.status = Status::Error(StatusCode::CONNECTION_ERROR, "probe target generation is stale");
+        return result;
+    }
+
+    if (preferred != nullptr) {
+        result.channel = preferred;
+        result.group = preferred->GetGroupLease();
+        result.generation = preferred->GetGeneration();
+        if (request.probe) {
+            if (AcquireProbe(preferred, preferred->GetGeneration())) {
+                result.code = AcquireCode::OK;
+                result.status = Status::OK();
+                return result;
+            }
+            if (preferred->GetState() != ChannelState::ACTIVE) {
+                result.code = AcquireCode::NO_ACTIVE;
+                result.status = Status::Error(StatusCode::CONNECTION_ERROR, "probe target is not active");
+            } else {
+                result.code = AcquireCode::PROBE_BUSY;
+                result.status = Status::Error(StatusCode::RESOURCE_BUSY, "probe already in flight");
+            }
+            return result;
+        }
+        if (AcquireChannel(preferred)) {
+            result.code = AcquireCode::OK;
+            result.status = Status::OK();
+            return result;
+        }
+        if (preferred->GetState() != ChannelState::ACTIVE) {
+            result.code = AcquireCode::NO_ACTIVE;
+            result.status = Status::Error(StatusCode::CONNECTION_ERROR, "preferred channel is not active");
+        } else if (!preferred->GetGroup()->CanAcquire()) {
+            result.code = AcquireCode::GROUP_LIMIT;
+            result.status = Status::Error(StatusCode::IN_PROGRESS, "group inflight limit reached");
+        } else {
+            result.code = AcquireCode::CHANNEL_FULL;
+            result.status = Status::Error(StatusCode::IN_PROGRESS, "channel inflight limit reached");
+        }
+        return result;
+    }
+
+    auto channel = routingPolicy_ == RoutingPolicy::LEAST_LOADED
+                       ? SelectByLeastLoaded(request.excludedGenerations)
+                       : SelectByRoundRobin(request.excludedGenerations);
+    if (channel != nullptr) {
+        result.code = AcquireCode::OK;
+        result.status = Status::OK();
+        result.channel = channel;
+        result.group = channel->GetGroupLease();
+        result.generation = channel->GetGeneration();
+        return result;
+    }
+    return BuildNoCandidateResult(request.excludedGenerations);
+}
+
+AcquireResult ConnectionManager::BuildNoCandidateResult(
+    const std::set<ConnectionAttemptKey>& excludedGenerations)
+{
+    AcquireResult result;
+    std::lock_guard<std::mutex> cacheLock(channelCacheMu_);
+    if (cacheDirty_.load(std::memory_order_acquire)) { RebuildChannelCache(); }
+    for (const auto& channel : channelCache_) {
+        if (channel->GetState() != ChannelState::ACTIVE ||
+            excludedGenerations.find(MakeAttemptKey(*channel)) != excludedGenerations.end()) {
+            continue;
+        }
+        result.channel = channel;
+        result.group = channel->GetGroupLease();
+        result.generation = channel->GetGeneration();
+        if (!channel->GetGroup()->CanAcquire()) {
+            result.code = AcquireCode::GROUP_LIMIT;
+            result.status = Status::Error(StatusCode::IN_PROGRESS, "group inflight limit reached");
+        } else {
+            result.code = AcquireCode::CHANNEL_FULL;
+            result.status = Status::Error(StatusCode::IN_PROGRESS, "channel inflight limit reached");
+        }
+        return result;
+    }
+    result.status = Status::Error(StatusCode::CONNECTION_ERROR, "no active connection available");
+    return result;
 }
 
 std::shared_ptr<ConnectionChannel> ConnectionManager::GetActiveConnection()
@@ -147,6 +318,103 @@ std::shared_ptr<ConnectionChannel> ConnectionManager::GetActiveConnection()
 }
 
 void ConnectionManager::SetRoutingPolicy(RoutingPolicy policy) { routingPolicy_ = policy; }
+
+void ConnectionManager::ConfigureFlow(bool enabled, std::uint32_t busyFloor,
+                                      std::uint64_t stableSuccessMs)
+{
+    flowControlEnabled_ = enabled;
+    busyFloor_ = busyFloor;
+    stableSuccessMs_ = stableSuccessMs;
+}
+
+bool ConnectionManager::AcquireChannel(const std::shared_ptr<ConnectionChannel>& channel)
+{
+    if (channel == nullptr || shuttingDown_.load(std::memory_order_acquire)) { return false; }
+    std::lock_guard<std::mutex> cacheLock(channelCacheMu_);
+    if (channel->GetState() != ChannelState::ACTIVE ||
+        channel->GetInflightCount() >= channel->GetGroup()->GetMaxInflightPerChannel() ||
+        !channel->GetGroup()->CanAcquire()) {
+        return false;
+    }
+    channel->IncrementInflight();
+    channel->GetGroup()->IncrementInflight();
+    return true;
+}
+
+bool ConnectionManager::IsCurrentGeneration(const std::shared_ptr<ConnectionChannel>& channel,
+                                            std::uint64_t generation) const
+{
+    if (channel == nullptr || generation == 0) { return generation == 0; }
+    auto leasedGroup = channel->GetGroupLease();
+    const ConnectionGroup* group = leasedGroup != nullptr ? leasedGroup.get() : channel->GetGroup();
+    if (group == nullptr) { return false; }
+    std::shared_lock<std::shared_mutex> lock(structureMu_);
+    for (const auto& current : group->GetChannels()) {
+        if (current->GetLogicalSlotId() == channel->GetLogicalSlotId() &&
+            current->GetGeneration() == generation) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ConnectionManager::AcquireProbe(const std::shared_ptr<ConnectionChannel>& channel,
+                                     std::uint64_t generation)
+{
+    return channel != nullptr && channel->TryStartProbe(generation);
+}
+
+std::vector<std::shared_ptr<ConnectionChannel>> ConnectionManager::GetChannelsSnapshot() const
+{
+    std::vector<std::shared_ptr<ConnectionChannel>> channels;
+    std::shared_lock<std::shared_mutex> lock(structureMu_);
+    for (const auto& group : groups_) {
+        const auto& groupChannels = group->GetChannels();
+        channels.insert(channels.end(), groupChannels.begin(), groupChannels.end());
+    }
+    return channels;
+}
+
+std::size_t ConnectionManager::VisitChannels(std::size_t& cursor, std::size_t budget,
+                                             const ChannelVisitor& visitor)
+{
+    if (budget == 0 || !visitor) { return 0; }
+
+    std::vector<std::shared_ptr<ConnectionChannel>> window;
+    std::size_t total = 0;
+    std::size_t start = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(structureMu_);
+        for (const auto& group : groups_) { total += group->GetChannels().size(); }
+        if (total == 0) {
+            cursor = 0;
+            return 0;
+        }
+        start = cursor % total;
+        const auto count = std::min(budget, total);
+        window.reserve(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            auto position = (start + index) % total;
+            for (const auto& group : groups_) {
+                const auto& channels = group->GetChannels();
+                if (position >= channels.size()) {
+                    position -= channels.size();
+                    continue;
+                }
+                window.emplace_back(channels[position]);
+                break;
+            }
+        }
+    }
+
+    std::size_t visited = 0;
+    for (const auto& channel : window) {
+        ++visited;
+        if (!visitor(channel)) { break; }
+    }
+    cursor = (start + visited) % total;
+    return visited;
+}
 
 void ConnectionManager::ReportFailure(const std::shared_ptr<ConnectionChannel>& channel)
 {
@@ -179,6 +447,7 @@ void ConnectionManager::ReportFailure(const std::shared_ptr<ConnectionChannel>& 
         }
         drainList_.push_back(channel);
     }
+    channel->GetGroup()->NotifyWaiters();
 }
 
 void ConnectionManager::ReportSuccess(const std::shared_ptr<ConnectionChannel>& channel)
@@ -205,6 +474,14 @@ void ConnectionManager::StopRecoverLoop()
 void ConnectionManager::RecoverLoop()
 {
     KV_DEBUG("ConnectionManager::RecoverLoop started");
+    const auto requeue = [this](const std::shared_ptr<ConnectionChannel>& channel) {
+        std::unique_lock<std::shared_mutex> lock(drainMu_);
+        for (const auto& existing : drainList_) {
+            if (existing.get() == channel.get()) { return; }
+        }
+        drainList_.push_back(channel);
+    };
+
     while (!stopRecover_.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(kRecoverIntervalMs));
         if (stopRecover_.load(std::memory_order_acquire)) { break; }
@@ -216,33 +493,38 @@ void ConnectionManager::RecoverLoop()
         }
 
         for (auto& channel : to_recover) {
+            auto state = GetRecoverState(channel);
+            if (state.nextRetryAt > std::chrono::steady_clock::now()) {
+                requeue(channel);
+                continue;
+            }
+
             ConnectionGroup* grp = channel->GetGroup();
-            NodeEndpoint ep = grp->GetEndpoint();
-            std::uint32_t gid = grp->GetGroupId();
-
-            std::vector<TransProvider::ConnectionHandle> new_handles;
-            auto createStatus =
-                provider_.CreateConnection(localIp_, ep.ip, ep.port, 1, timeout_, new_handles);
-
+            const auto endpoint = grp->GetEndpoint();
+            channel->SetState(ChannelState::RECONNECTING);
+            std::vector<TransProvider::ConnectionHandle> newHandles;
+            const auto createStatus = CreateConnectionWithRetry(endpoint, 1, state.backoffMs, newHandles);
             if (!createStatus.ok()) {
-                KV_DEBUG(
-                    "ConnectionManager::RecoverLoop RebuildChannel FAILED, keep in drain_list for "
-                    "retry group_id={}",
-                    gid);
-                std::unique_lock<std::shared_mutex> lock(drainMu_);
-                drainList_.push_back(std::move(channel));
+                channel->SetState(ChannelState::FAILED);
+                KV_DEBUG("ConnectionManager::RecoverLoop rebuild failed, schedule backoff group_id={}",
+                         grp->GetGroupId());
+                ScheduleRecoverFailure(channel, state);
+                requeue(channel);
                 continue;
             }
 
             {
                 std::unique_lock<std::shared_mutex> lock(structureMu_);
                 grp->RemoveChannel(channel.get());
-                auto new_ch = grp->AddChannel(new_handles[0], &provider_);
-                KV_DEBUG(
-                    "ConnectionManager::RecoverLoop RebuildChannel OK: new_ch_id={} group_id={}",
-                    new_ch->GetChannelId(), gid);
-                cacheDirty_.store(true, std::memory_order_release);
+                auto newChannel = grp->AddChannel(newHandles[0], &provider_, channel->GetLogicalSlotId());
+                grp->NotifyWaiters();
+                KV_DEBUG("ConnectionManager::RecoverLoop channel recovered group_id={} old_ch_id={} "
+                         "new_ch_id={} logicalSlot={} generation={}",
+                         grp->GetGroupId(), channel->GetChannelId(), newChannel->GetChannelId(),
+                         newChannel->GetLogicalSlotId(), newChannel->GetGeneration());
             }
+            ResetRecoverState(channel);
+            cacheDirty_.store(true, std::memory_order_release);
         }
     }
     KV_DEBUG("ConnectionManager::RecoverLoop stopped");
@@ -262,7 +544,8 @@ void ConnectionManager::RebuildChannelCache()
     cacheDirty_.store(false, std::memory_order_release);
 }
 
-std::shared_ptr<ConnectionChannel> ConnectionManager::SelectByRoundRobin()
+std::shared_ptr<ConnectionChannel> ConnectionManager::SelectByRoundRobin(
+    const std::set<ConnectionAttemptKey>& excludedGenerations)
 {
     std::lock_guard<std::mutex> cacheLock(channelCacheMu_);
     if (cacheDirty_.load(std::memory_order_acquire)) { RebuildChannelCache(); }
@@ -277,9 +560,12 @@ std::shared_ptr<ConnectionChannel> ConnectionManager::SelectByRoundRobin()
     for (std::size_t i = 0; i < total; ++i) {
         std::size_t pos = (start + i) % total;
         const auto& channel = channelCache_[pos];
+        if (excludedGenerations.find(MakeAttemptKey(*channel)) != excludedGenerations.end()) { continue; }
         if (channel->GetState() != ChannelState::ACTIVE) { continue; }
-        if (channel->GetInflightCount() < maxInflightPerChannel) {
+        const auto maxInflightPerChannel = channel->GetGroup()->GetMaxInflightPerChannel();
+        if (channel->GetInflightCount() < maxInflightPerChannel && channel->GetGroup()->CanAcquire()) {
             channel->IncrementInflight();
+            channel->GetGroup()->IncrementInflight();
             return channel;
         }
     }
@@ -290,7 +576,8 @@ std::shared_ptr<ConnectionChannel> ConnectionManager::SelectByRoundRobin()
     return nullptr;
 }
 
-std::shared_ptr<ConnectionChannel> ConnectionManager::SelectByLeastLoaded()
+std::shared_ptr<ConnectionChannel> ConnectionManager::SelectByLeastLoaded(
+    const std::set<ConnectionAttemptKey>& excludedGenerations)
 {
     std::lock_guard<std::mutex> cacheLock(channelCacheMu_);
     if (cacheDirty_.load(std::memory_order_acquire)) { RebuildChannelCache(); }
@@ -302,9 +589,11 @@ std::shared_ptr<ConnectionChannel> ConnectionManager::SelectByLeastLoaded()
     const auto maxInflightPerChannel = maxInflightPerChannel_;
 
     for (const auto& channel : channelCache_) {
+        if (excludedGenerations.find(MakeAttemptKey(*channel)) != excludedGenerations.end()) { continue; }
         auto inflight = channel->GetInflightCount();
+        const auto maxInflightPerChannel = channel->GetGroup()->GetMaxInflightPerChannel();
         if (channel->GetState() == ChannelState::ACTIVE && inflight < maxInflightPerChannel &&
-            inflight < min_inflight) {
+            inflight < min_inflight && channel->GetGroup()->CanAcquire()) {
             min_inflight = inflight;
             selected = channel;
             if (min_inflight == 0) break;
@@ -313,6 +602,7 @@ std::shared_ptr<ConnectionChannel> ConnectionManager::SelectByLeastLoaded()
 
     if (selected) {
         selected->IncrementInflight();
+        selected->GetGroup()->IncrementInflight();
         return selected;
     }
     KV_DEBUG(
@@ -320,6 +610,45 @@ std::shared_ptr<ConnectionChannel> ConnectionManager::SelectByLeastLoaded()
         "reached maximum inflight limit, max_inflight_per_channel={}",
         maxInflightPerChannel);
     return nullptr;
+}
+
+Status ConnectionManager::GetHealthSnapshot(NodeHealthSnapshot& snapshot) const
+{
+    if (shuttingDown_.load(std::memory_order_acquire)) {
+        return Status::Error(StatusCode::NOT_INITIALIZED, "connection manager shutting down");
+    }
+    snapshot = NodeHealthSnapshot{};
+    std::shared_lock<std::shared_mutex> structureLock(structureMu_);
+    std::lock_guard<std::mutex> recoverLock(recoverStateMu_);
+    std::uint32_t total = 0;
+    for (const auto& group : groups_) {
+        for (const auto& channel : group->GetChannels()) {
+            ++total;
+            snapshot.generation = std::max(snapshot.generation, channel->GetGeneration());
+            switch (channel->GetState()) {
+            case ChannelState::ACTIVE:
+                ++snapshot.activeCount;
+                break;
+            case ChannelState::DRAINING:
+                ++snapshot.drainingCount;
+                break;
+            case ChannelState::RECONNECTING:
+                ++snapshot.reconnectingCount;
+                break;
+            case ChannelState::FAILED:
+                ++snapshot.failedCount;
+                break;
+            }
+            const auto recoverIt = recoverStates_.find(channel.get());
+            if (recoverIt != recoverStates_.end()) {
+                snapshot.nextRetryAt = std::min(snapshot.nextRetryAt, recoverIt->second.nextRetryAt);
+            }
+        }
+    }
+    snapshot.health = snapshot.activeCount == 0
+                          ? NodeHealth::RED
+                          : (snapshot.activeCount < total ? NodeHealth::YELLOW : NodeHealth::GREEN);
+    return Status::OK();
 }
 
 std::int64_t ConnectionManager::TotalInflightCount()

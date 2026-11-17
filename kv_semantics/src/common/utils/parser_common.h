@@ -67,6 +67,12 @@ bool ApplyTransportProviderConfigField(TransportConfig& config, const std::strin
 bool ApplyTransportDeviceConfigField(TransportConfig& config, const std::string& key,
                                      const std::string& value);
 
+// Returns OK for recognized retry/probe/flow/recovery fields, INVALID_ARGUMENT for
+// malformed values, and UNSUPPORTED for unrelated fields.
+Status NormalizeChannelFullPolicy(std::string& policy);
+Status ApplyTransportRetryConfigField(TransportConfig& config, const std::string& key,
+                                      const std::string& value);
+
 NodeEndpoint ParseTransportEndpoint(const std::string& value);
 
 }  // namespace kv

@@ -1165,6 +1165,16 @@ Status KvKeepAliveProtocol::ValidateRequest(const KvKeepAliveRequest& r) const
     return Status::OK();
 }
 
+Status KvKeepAliveProtocol::UnpackCqe(const std::uint32_t* data, std::uint16_t,
+                                      KvResponse& out) const
+{
+    if (data == nullptr) {
+        return Status::Error(StatusCode::INVALID_ARGUMENT, "KeepAlive: null CQE buffer");
+    }
+    UnpackCqeBase(data, out);
+    return Status::OK();
+}
+
 Status KvKeepAliveProtocol::VerifyPackedBuffer(const std::uint32_t* data, std::size_t length) const
 {
     constexpr std::size_t kExpectedLength = kSqeDwordCount * sizeof(std::uint32_t);
@@ -1238,6 +1248,9 @@ Status ProtocolManager::UnpackResponse(const void* data_ptr, KvOpcode opcode,
 
 Status ProtocolManager::PollResponseCid(const void* data_ptr, std::uint16_t& cid) const
 {
+    if (data_ptr == nullptr) {
+        return Status::Error(StatusCode::INVALID_ARGUMENT, "PollResponseCid: null response buffer");
+    }
     auto* data = static_cast<const std::uint32_t*>(data_ptr);
     cid = __atomic_load_n(data + 3, __ATOMIC_ACQUIRE) & 0xFFFF;
     return Status::OK();

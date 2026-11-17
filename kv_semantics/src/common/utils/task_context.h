@@ -39,18 +39,25 @@
 namespace kv {
 
 class AsuTransport;
+class ConnectionChannel;
+struct ClientTask;
+class ProbeTaskLease;
 struct TransportSubBatchContext;
 struct ViewSnapshot;
 
 enum class ClientTaskState {
     PENDING = 0,
     INFLIGHT = 1,
-    COMPLETED = 2,
+    FLOW_WAIT = 2,
+    COMPLETED = 3,
 };
 
 enum class AsuOpType {
     QUERY = 0,
     LOAD = 1,
+    // STORE is create-and-fill: absent keys are created, non-full keys may be
+    // overwritten, and full keys reject later writes. It is non-idempotent on
+    // outcome-unknown paths even though some partial writes may be repeatable.
     STORE = 2,
     BATCH_LOAD = 3,
     BATCH_STORE = 4,
@@ -58,14 +65,25 @@ enum class AsuOpType {
     KEEP_ALIVE = 6,
 };
 
+enum class TaskOrigin : std::uint8_t {
+    BUSINESS = 0,
+    // KeepAlive probe tasks use the same transport machinery but do not represent
+    // business writes and are completed with their original probe status.
+    PROBE = 1,
+};
+
 enum class TransportTaskState {
     PENDING = 0,
     INFLIGHT = 1,
-    COMPLETED = 2,
+    FLOW_WAIT = 2,
+    COMPLETED = 3,
 };
 
 enum class TransportSubBatchState {
+    // No final result yet; this includes an attempt waiting for response or retry backoff.
     PENDING = 0,
+    // Final result is fixed and aggregation may proceed; an earlier attempt may have
+    // completed without making the whole subBatch COMPLETED.
     COMPLETED = 1,
 };
 
@@ -90,7 +108,12 @@ struct TransportTask {
     NodeId nodeId{0};
     TaskId taskId{kInvalidTaskId};
     AsuOpType opType{AsuOpType::QUERY};
+    TaskOrigin origin{TaskOrigin::BUSINESS};
+    std::shared_ptr<ConnectionChannel> targetChannel;
+    std::uint64_t targetGeneration{0};
+    std::shared_ptr<ProbeTaskLease> probeLease;
     std::weak_ptr<AsuTransport> transport;
+    std::weak_ptr<ClientTask> clientTask;
     std::vector<CacheKey> keys;
     std::vector<KVBuffer> entries;
     std::vector<std::size_t> originalIndices;
@@ -102,6 +125,7 @@ struct TransportTask {
     std::chrono::steady_clock::time_point deadline{std::chrono::steady_clock::time_point::max()};
     TaskCompletionCallback onComplete;
     std::atomic<bool> completionNotified{false};
+    std::atomic<bool> cancelRequested{false};
     std::chrono::steady_clock::time_point submittedAt{};
     std::chrono::steady_clock::time_point sendCompletedAt{};
     std::function<void()> onSendComplete;
@@ -140,6 +164,7 @@ struct ClientTask {
     std::chrono::steady_clock::time_point processingStartedAt{};
     std::atomic<bool> completionMetricRecorded{false};
     std::atomic<ClientTaskState> state{ClientTaskState::PENDING};
+    std::atomic<bool> cancelRequested{false};
     Status finalStatus{Status::OK()};
 
     std::mutex waitMu;

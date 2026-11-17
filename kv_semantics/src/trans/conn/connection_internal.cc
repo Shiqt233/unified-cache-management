@@ -31,8 +31,10 @@ namespace kv {
 
 ConnectionChannel::ConnectionChannel(std::uint32_t id, ConnectionGroup* grp,
                                      TransProvider::ConnectionHandle handle,
-                                     TransProvider* provider)
-    : channelId(id), group(grp), handle_(handle), provider_(provider)
+                                     TransProvider* provider, std::uint64_t generation,
+                                     std::uint64_t logicalSlotId)
+    : channelId(id), logicalSlotId(logicalSlotId), generation(generation), group(grp),
+      handle_(handle), provider_(provider)
 {
     state.store(ChannelState::ACTIVE, std::memory_order_release);
     inflightCount.store(0, std::memory_order_release);
@@ -74,6 +76,33 @@ void ConnectionChannel::ReleaseInflight()
     }
 }
 
+void ConnectionChannel::MarkBusinessSubmit()
+{
+    lastBusinessSubmitNs.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                               std::memory_order_release);
+}
+
+bool ConnectionChannel::IsIdle(std::chrono::steady_clock::time_point now,
+                               std::chrono::steady_clock::duration period) const
+{
+    if (GetState() != ChannelState::ACTIVE || GetInflightCount() != 0 ||
+        probeInFlight.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const auto last = lastBusinessSubmitNs.load(std::memory_order_acquire);
+    if (last == 0) { return true; }
+    return now.time_since_epoch().count() - last >= period.count();
+}
+
+bool ConnectionChannel::TryStartProbe(std::uint64_t expectedGeneration)
+{
+    if (generation != expectedGeneration || GetState() != ChannelState::ACTIVE) { return false; }
+    bool expected = false;
+    return probeInFlight.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+}
+
+void ConnectionChannel::FinishProbe() { probeInFlight.store(false, std::memory_order_release); }
+
 bool ConnectionChannel::MarkForDrain()
 {
     ChannelState expected = ChannelState::ACTIVE;
@@ -96,13 +125,18 @@ ConnectionGroup::ConnectionGroup(std::uint32_t id, const NodeEndpoint& ep,
 }
 
 std::shared_ptr<ConnectionChannel> ConnectionGroup::AddChannel(ConnectionHandle handle,
-                                                               TransProvider* provider)
+                                                               TransProvider* provider, std::uint64_t logicalSlotId)
 {
     auto id = nextChannelId_.fetch_add(1, std::memory_order_relaxed);
-    auto channel = std::make_shared<ConnectionChannel>(id, this, handle, provider);
+    auto generation = nextGeneration_.fetch_add(1, std::memory_order_relaxed);
+    const auto assignedSlot = logicalSlotId == UINT64_MAX ? channels.size() : logicalSlotId;
+    auto channel = std::make_shared<ConnectionChannel>(id, this, handle, provider, generation,
+                                                       assignedSlot);
+    if (const auto lease = weak_from_this(); !lease.expired()) { channel->SetGroupLease(lease); }
     channels.push_back(channel);
-    KV_DEBUG("ConnectionGroup::AddChannel groupId={} ch_id={} totalChannels={}", groupId,
-             channel->GetChannelId(), channels.size());
+    flowController_.NotifyAll();
+    KV_DEBUG("ConnectionGroup::AddChannel groupId={} ch_id={} logicalSlot={} totalChannels={}",
+             groupId, channel->GetChannelId(), channel->GetLogicalSlotId(), channels.size());
     return channel;
 }
 
@@ -115,8 +149,11 @@ void ConnectionGroup::RemoveChannel(ConnectionChannel* channel)
         KV_DEBUG("ConnectionGroup::RemoveChannel groupId={} ch_id={} removed, totalChannels={}",
                  groupId, channel->GetChannelId(), channels.size() - 1);
         channels.erase(it);
+        flowController_.NotifyAll();
     }
 }
+
+void ConnectionGroup::NotifyWaiters() { flowController_.NotifyAll(); }
 
 bool ConnectionGroup::HasActiveChannel() const
 {
@@ -124,6 +161,51 @@ bool ConnectionGroup::HasActiveChannel() const
         if (channel->GetState() == ChannelState::ACTIVE) { return true; }
     }
     return false;
+}
+
+void ConnectionGroup::ConfigureFlow(std::uint64_t normalLimit, std::uint64_t busyFloor, bool enabled,
+                                    std::uint64_t stableSuccessMs,
+                                    std::uint32_t maxInflightPerChannel)
+{
+    maxInflightPerChannel_ = maxInflightPerChannel;
+    flowController_.Configure(normalLimit, busyFloor, enabled, stableSuccessMs);
+}
+
+bool ConnectionGroup::CanAcquire() const
+{
+    return flowController_.CanAcquire(inflightCount.load(std::memory_order_acquire));
+}
+
+void ConnectionGroup::IncrementInflight() { inflightCount.fetch_add(1, std::memory_order_acq_rel); }
+
+void ConnectionGroup::ReleaseInflight()
+{
+    auto current = inflightCount.load(std::memory_order_acquire);
+    while (current > 0) {
+        if (inflightCount.compare_exchange_weak(current, current - 1, std::memory_order_acq_rel)) {
+            flowController_.NotifyRelease();
+            return;
+        }
+    }
+}
+
+void ConnectionGroup::OnBusy() { flowController_.OnBusy(); }
+
+void ConnectionGroup::OnBusinessSuccess(std::chrono::steady_clock::time_point now)
+{
+    flowController_.OnBusinessSuccess(now);
+}
+
+void ConnectionGroup::OnNonSuccess() { flowController_.OnNonSuccess(); }
+
+GroupFlowController::Snapshot ConnectionGroup::GetFlowSnapshot() const
+{
+    return flowController_.GetSnapshot();
+}
+
+void ConnectionGroup::WaitForFlowRelease(std::chrono::milliseconds maxWait)
+{
+    flowController_.WaitForRelease(maxWait);
 }
 
 }  // namespace kv

@@ -279,6 +279,8 @@ public:
     {
         return kSqeDwordCount * sizeof(std::uint32_t);
     }
+    Status UnpackCqe(const std::uint32_t* data, std::uint16_t batch_number,
+                     KvResponse& out) const override;
     Status VerifyPackedBuffer(const std::uint32_t* data, std::size_t length) const override;
 
 private:

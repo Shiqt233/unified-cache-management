@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include "conn/connection_manager.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -42,6 +43,7 @@ static std::atomic<int> g_capabilityQueryCount{0};
 class StubTransProvider : public TransProvider {
 public:
     Status createStatus{Status::OK()};
+    std::vector<Status> createStatuses;
     Status capabilityStatus{Status::OK()};
     ServerKvCapabilities serverCapabilities;
     ConnectionHandle capabilityQueryHandle{nullptr};
@@ -51,7 +53,13 @@ public:
     {
         g_createCount.fetch_add(1);
         handles.clear();
-        if (!createStatus.ok()) { return createStatus; }
+        if (!createStatuses.empty()) {
+            const auto index = std::min(static_cast<std::size_t>(g_createCount.load() - 1),
+                                        createStatuses.size() - 1);
+            if (!createStatuses[index].ok()) { return createStatuses[index]; }
+        } else if (!createStatus.ok()) {
+            return createStatus;
+        }
         for (std::uint32_t i = 0; i < qpNum; ++i) {
             handles.push_back(reinterpret_cast<ConnectionHandle>(
                 static_cast<uintptr_t>(g_createCount.load() * 100 + i + 1)));
@@ -647,6 +655,278 @@ TEST(ConnectionManagerTest, ReportFailureMultipleTimesDoesNotDuplicateInDrainLis
 
     mgr.Shutdown();
     EXPECT_EQ(g_deleteCount.load(), 1);
+}
+
+TEST(ConnectionManagerTest, GroupBudgetBlocksAcquireAndBusyUpdatesLimit)
+{
+    g_createCount = 0;
+    g_deleteCount = 0;
+    StubTransProvider provider;
+    ConnectionManager mgr(provider, "", 5000);
+    mgr.ConfigureFlow(true, 1, 60000);
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint(), 1).ok());
+
+    auto channel = mgr.SelectConnection();
+    ASSERT_NE(channel, nullptr);
+    const auto normalLimit = channel->GetGroup()->GetFlowSnapshot().normalLimit;
+    channel->GetGroup()->OnBusy();
+    EXPECT_EQ(channel->GetGroup()->GetFlowSnapshot().currentLimit, normalLimit - 2);
+
+    for (std::uint64_t i = 1; i < normalLimit - 1; ++i) { (void)mgr.SelectConnection(); }
+    EXPECT_EQ(mgr.SelectConnection(), nullptr);
+
+    while (channel->GetInflightCount() > 0) {
+        channel->ReleaseInflight();
+        channel->GetGroup()->ReleaseInflight();
+    }
+    channel->GetGroup()->OnBusinessSuccess(std::chrono::steady_clock::now());
+    channel->GetGroup()->OnBusinessSuccess(std::chrono::steady_clock::now());
+    EXPECT_EQ(channel->GetGroup()->GetFlowSnapshot().currentLimit, normalLimit);
+    EXPECT_FALSE(channel->GetGroup()->GetFlowSnapshot().congested);
+    EXPECT_EQ(channel->GetGroup()->GetInflightCount(), std::uint32_t{0});
+    EXPECT_TRUE(mgr.Shutdown().ok());
+}
+
+TEST(ConnectionManagerTest, FlowControlDisabledKeepsOldSelection)
+{
+    g_createCount = 0;
+    g_deleteCount = 0;
+    StubTransProvider provider;
+    ConnectionManager mgr(provider, "", 5000);
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint(), 1).ok());
+    auto first = mgr.SelectConnection();
+    auto second = mgr.SelectConnection();
+    EXPECT_NE(first, nullptr);
+    EXPECT_NE(second, nullptr);
+    EXPECT_TRUE(mgr.Shutdown().ok());
+}
+
+TEST(ConnectionManagerTest, AddGroupRetriesOnInitialConnectionFailure)
+{
+    g_createCount = 0;
+    g_deleteCount = 0;
+    StubTransProvider provider;
+    provider.createStatuses = {Status::Error(StatusCode::CONNECTION_ERROR, "first create failed"),
+                               Status::OK()};
+    ConnectionManager mgr(provider, "", 5000);
+    mgr.ConfigureRecovery(1, 1, 10);
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint(), 1).ok());
+    EXPECT_EQ(g_createCount.load(), 2);
+
+    auto channel = mgr.SelectConnection();
+    ASSERT_NE(channel, nullptr);
+    EXPECT_EQ(channel->GetGeneration(), std::uint64_t{1});
+    EXPECT_TRUE(mgr.Shutdown().ok());
+}
+
+TEST(ConnectionManagerTest, RecoveryRetriesAndInstallsNewGeneration)
+{
+    g_createCount = 0;
+    g_deleteCount = 0;
+    StubTransProvider provider;
+    provider.createStatuses = {Status::OK(), Status::Error(StatusCode::CONNECTION_ERROR, "recover failed"),
+                               Status::OK()};
+    ConnectionManager mgr(provider, "", 5000, 1);
+    mgr.ConfigureRecovery(1, 1, 2);
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint(), 1).ok());
+    mgr.StartRecoverLoop();
+
+    auto oldChannel = mgr.SelectConnection();
+    ASSERT_NE(oldChannel, nullptr);
+    const auto oldGeneration = oldChannel->GetGeneration();
+    mgr.ReportFailure(oldChannel);
+    oldChannel.reset();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    auto recovered = mgr.SelectConnection();
+    ASSERT_NE(recovered, nullptr);
+    EXPECT_GT(recovered->GetGeneration(), oldGeneration);
+    EXPECT_EQ(recovered->GetState(), ChannelState::ACTIVE);
+    EXPECT_EQ(g_createCount.load(), 3);
+    recovered->ReleaseInflight();
+    recovered->GetGroup()->ReleaseInflight();
+    recovered.reset();
+    EXPECT_TRUE(mgr.Shutdown().ok());
+    EXPECT_EQ(g_deleteCount.load(), 2);
+}
+
+TEST(ConnectionManagerTest, RecoveryBackoffDefersNextAttempt)
+{
+    g_createCount = 0;
+    g_deleteCount = 0;
+    StubTransProvider provider;
+    provider.createStatuses = {Status::OK(), Status::Error(StatusCode::CONNECTION_ERROR, "recover failed"),
+                               Status::Error(StatusCode::CONNECTION_ERROR, "recover failed again"),
+                               Status::Error(StatusCode::CONNECTION_ERROR, "recover failed third")};
+    ConnectionManager mgr(provider, "", 5000, 1);
+    mgr.ConfigureRecovery(0, 20, 40);
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint(), 1).ok());
+    mgr.StartRecoverLoop();
+
+    auto channel = mgr.SelectConnection();
+    ASSERT_NE(channel, nullptr);
+    mgr.ReportFailure(channel);
+    channel.reset();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_EQ(g_createCount.load(), 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    EXPECT_GE(g_createCount.load(), 3);
+    EXPECT_TRUE(mgr.Shutdown().ok());
+}
+
+TEST(ConnectionManagerTest, RecoveryFailureUsesFailedAndReconnectingStates)
+{
+    g_createCount = 0;
+    g_deleteCount = 0;
+    StubTransProvider provider;
+    provider.createStatuses = {Status::OK(), Status::Error(StatusCode::CONNECTION_ERROR, "recover failed"),
+                               Status::OK()};
+    ConnectionManager mgr(provider, "", 5000, 1);
+    mgr.ConfigureRecovery(0, 200, 200);
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint(), 1).ok());
+    mgr.StartRecoverLoop();
+
+    auto channel = mgr.SelectConnection();
+    ASSERT_NE(channel, nullptr);
+    const auto oldGeneration = channel->GetGeneration();
+    mgr.ReportFailure(channel);
+    channel.reset();
+
+    ChannelState observed = ChannelState::DRAINING;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto snapshot = mgr.GetChannelsSnapshot();
+        if (!snapshot.empty() && snapshot.front()->GetState() == ChannelState::FAILED) {
+            observed = ChannelState::FAILED;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(observed, ChannelState::FAILED);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    auto recovered = mgr.SelectConnection();
+    ASSERT_NE(recovered, nullptr);
+    EXPECT_EQ(recovered->GetState(), ChannelState::ACTIVE);
+    EXPECT_GT(recovered->GetGeneration(), oldGeneration);
+    EXPECT_EQ(g_createCount.load(), 3);
+    recovered->ReleaseInflight();
+    recovered->GetGroup()->ReleaseInflight();
+    recovered.reset();
+    EXPECT_TRUE(mgr.Shutdown().ok());
+}
+
+TEST(ConnectionGroupTest, LogicalSlotSurvivesGenerationReplacement)
+{
+    StubTransProvider provider;
+    ConnectionGroup group(0, MakeEndpoint());
+    auto oldChannel = group.AddChannel(reinterpret_cast<ConnectionHandle>(1), &provider, 7);
+    const auto oldGeneration = oldChannel->GetGeneration();
+    const auto oldChannelId = oldChannel->GetChannelId();
+    group.RemoveChannel(oldChannel.get());
+
+    auto recovered = group.AddChannel(reinterpret_cast<ConnectionHandle>(2), &provider,
+                                      oldChannel->GetLogicalSlotId());
+
+    EXPECT_EQ(recovered->GetLogicalSlotId(), std::uint64_t{7});
+    EXPECT_GT(recovered->GetGeneration(), oldGeneration);
+    EXPECT_NE(recovered->GetChannelId(), oldChannelId);
+    const auto key = MakeAttemptKey(*recovered);
+    EXPECT_EQ(key.groupId, std::uint32_t{0});
+    EXPECT_EQ(key.logicalSlotId, std::uint64_t{7});
+    EXPECT_EQ(key.generation, recovered->GetGeneration());
+}
+
+TEST(ConnectionManagerTest, TryAcquireReportsFullAndNoActive)
+{
+    StubTransProvider provider;
+    provider.serverCapabilities.ioQueueDepth = 1;
+    ConnectionManager mgr(provider, "", 5000);
+    ConnectionRequest request;
+    const auto noActive = mgr.TryAcquire(request);
+    EXPECT_EQ(noActive.code, AcquireCode::NO_ACTIVE);
+    EXPECT_EQ(noActive.status.code, StatusCode::CONNECTION_ERROR);
+
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint(), 1).ok());
+    auto first = mgr.TryAcquire(request);
+    ASSERT_TRUE(first.ok()) << first.status.message;
+    const auto full = mgr.TryAcquire(request);
+    EXPECT_EQ(full.code, AcquireCode::CHANNEL_FULL);
+    EXPECT_EQ(full.status.code, StatusCode::IN_PROGRESS);
+
+    first.channel->ReleaseInflight();
+    first.channel->GetGroup()->ReleaseInflight();
+    auto afterRelease = mgr.TryAcquire(request);
+    ASSERT_TRUE(afterRelease.ok()) << afterRelease.status.message;
+    afterRelease.channel->ReleaseInflight();
+    afterRelease.channel->GetGroup()->ReleaseInflight();
+}
+
+TEST(ConnectionManagerTest, TryAcquireReportsGroupLimit)
+{
+    StubTransProvider provider;
+    ConnectionManager mgr(provider, "", 5000);
+    mgr.ConfigureFlow(true, 0, 60000);
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint(), 1).ok());
+    auto channel = mgr.SelectConnection();
+    ASSERT_NE(channel, nullptr);
+    channel->GetGroup()->ConfigureFlow(1, 0, true, 60000, 1);
+
+    const auto limited = mgr.TryAcquire(ConnectionRequest{});
+    EXPECT_EQ(limited.code, AcquireCode::GROUP_LIMIT);
+    EXPECT_EQ(limited.status.code, StatusCode::IN_PROGRESS);
+
+    channel->GetGroup()->OnBusinessSuccess(std::chrono::steady_clock::now());
+    channel->ReleaseInflight();
+    channel->GetGroup()->ReleaseInflight();
+    auto recovered = mgr.TryAcquire(ConnectionRequest{});
+    ASSERT_TRUE(recovered.ok()) << recovered.status.message;
+    recovered.channel->ReleaseInflight();
+    recovered.channel->GetGroup()->ReleaseInflight();
+}
+
+TEST(ConnectionManagerTest, HealthSnapshotReflectsDrainAndRecovery)
+{
+    g_createCount = 0;
+    StubTransProvider provider;
+    ConnectionManager mgr(provider, "", 5000, 1);
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint(), 2).ok());
+
+    NodeHealthSnapshot snapshot;
+    ASSERT_TRUE(mgr.GetHealthSnapshot(snapshot).ok());
+    EXPECT_EQ(snapshot.health, NodeHealth::GREEN);
+    EXPECT_EQ(snapshot.activeCount, std::uint32_t{2});
+
+    const auto channels = mgr.GetChannelsSnapshot();
+    ASSERT_EQ(channels.size(), std::size_t{2});
+    const auto oldGeneration = channels[0]->GetGeneration();
+    const auto oldSlot = channels[0]->GetLogicalSlotId();
+    mgr.ReportFailure(channels[0]);
+    ASSERT_TRUE(mgr.GetHealthSnapshot(snapshot).ok());
+    EXPECT_EQ(snapshot.health, NodeHealth::YELLOW);
+    EXPECT_EQ(snapshot.activeCount, std::uint32_t{1});
+    EXPECT_EQ(snapshot.drainingCount, std::uint32_t{1});
+
+    mgr.StartRecoverLoop();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    do {
+        ASSERT_TRUE(mgr.GetHealthSnapshot(snapshot).ok());
+        if (snapshot.health == NodeHealth::GREEN && snapshot.activeCount == 2) { break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (std::chrono::steady_clock::now() < deadline);
+    mgr.StopRecoverLoop();
+
+    EXPECT_EQ(snapshot.health, NodeHealth::GREEN);
+    EXPECT_EQ(snapshot.activeCount, std::uint32_t{2});
+    const auto recoveredChannels = mgr.GetChannelsSnapshot();
+    const auto recovered = std::find_if(recoveredChannels.begin(), recoveredChannels.end(),
+                                        [&](const auto& channel) {
+                                            return channel->GetLogicalSlotId() == oldSlot;
+                                        });
+    ASSERT_NE(recovered, recoveredChannels.end());
+    EXPECT_GT((*recovered)->GetGeneration(), oldGeneration);
+    EXPECT_TRUE(mgr.Shutdown().ok());
 }
 
 }  // namespace kv::test

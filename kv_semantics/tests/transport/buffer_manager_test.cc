@@ -440,5 +440,27 @@ TEST_F(BufferManagerTest, RegistrationDescriptionRequiresInitialization)
     ASSERT_EQ(status.code, StatusCode::NOT_INITIALIZED);
 }
 
+TEST_F(BufferManagerTest, QuarantineKeepsSlotOutOfPoolUntilRelease)
+{
+    BufferManager mgr;
+    ASSERT_TRUE(mgr.Init("quarantine_buffer", MemoryType::HOST, 64, 1).ok());
+    ScatterGatherEntry first;
+    ASSERT_TRUE(mgr.Allocate(64, first).ok());
+    const auto slot = first.slot_index;
+
+    ASSERT_TRUE(mgr.Quarantine(slot).ok());
+    ASSERT_TRUE(mgr.Free(slot).ok());
+    EXPECT_TRUE(mgr.IsQuarantined(slot));
+    ScatterGatherEntry blocked;
+    EXPECT_EQ(mgr.Allocate(64, blocked).code, StatusCode::RESOURCE_BUSY);
+
+    ASSERT_TRUE(mgr.ReleaseQuarantined(slot).ok());
+    EXPECT_FALSE(mgr.IsQuarantined(slot));
+    ScatterGatherEntry reused;
+    ASSERT_TRUE(mgr.Allocate(64, reused).ok());
+    EXPECT_EQ(reused.slot_index, slot);
+    ASSERT_TRUE(mgr.Free(reused.slot_index).ok());
+}
+
 }  // namespace
 }  // namespace kv::test

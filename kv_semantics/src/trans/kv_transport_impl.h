@@ -40,6 +40,8 @@
 
 namespace kv {
 
+class ClientProbeScheduler;
+
 class AsuTransportImpl final : public AsuTransport {
 public:
     AsuTransportImpl();
@@ -52,12 +54,16 @@ public:
     Status Shutdown() override;
 
     Status CheckHealth() override;
+    Status GetConnectionHealth(NodeHealthSnapshot& snapshot) override;
 
     Status Submit(const TransportTaskPtr& task) override;
 
     Status Cancel(TaskId taskId) override;
+    bool HasInflightMemory(MRHandle handle) override;
 
 private:
+    friend class ClientProbeScheduler;
+
     Status SubmitTask(const TransportTaskPtr& task);
     void WorkerLoop();
     void CompletionLoop();

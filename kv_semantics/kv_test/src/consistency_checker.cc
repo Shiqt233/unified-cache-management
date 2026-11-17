@@ -1,4 +1,4 @@
-﻿#include "consistency_checker.h"
+#include "consistency_checker.h"
 #include <string>
 #include "key_value_generator.h"
 #include "trans_types.h"

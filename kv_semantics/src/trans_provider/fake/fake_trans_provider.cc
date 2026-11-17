@@ -383,6 +383,9 @@ Status FakeTransProvider::ResolveLocalAddress(const void* providerAddr, std::siz
                          "fake backend IO buffer is not registered");
 }
 
+// Test-double behavior: this fake writes at the target offset and overwrites an
+// existing file. It does not model the real ASU create/fill/full-seal state machine
+// or CQE_KEY_ALREADY_EXISTED on a full slot, so it cannot prove STORE retry safety.
 bool FakeTransProvider::StoreBytes(NodeId nodeId, const CacheKey& key, std::uint32_t offset,
                                    std::uint64_t addr, std::uint32_t length)
 {
@@ -471,6 +474,9 @@ bool FakeTransProvider::DeleteKey(NodeId nodeId, const CacheKey& key)
     return !errorCode;
 }
 
+// Fake existence is based on file presence, not on the real backend's possible
+// "only a fully written slot is visible" rule. Query-based reconciliation tests
+// must not treat this test double as evidence about partial-write visibility.
 bool FakeTransProvider::ExistsKey(NodeId nodeId, const CacheKey& key)
 {
     std::shared_lock<std::shared_mutex> keyLock(KeyMutex(key));
@@ -478,6 +484,9 @@ bool FakeTransProvider::ExistsKey(NodeId nodeId, const CacheKey& key)
     return std::filesystem::exists(KeyPath(config_.storePath, nodeId, key), errorCode);
 }
 
+// The fake executes the wire buffer_length field. The current client sets both
+// buffer_length and length from region.size; this test path does not expose an
+// independent server-side slot capacity or written-range accounting.
 Status FakeTransProvider::CompleteStore(NodeId nodeId, const std::uint32_t* request,
                                         std::uint32_t* flagBuffer)
 {
@@ -508,6 +517,9 @@ Status FakeTransProvider::CompleteRetrieve(NodeId nodeId, const std::uint32_t* r
     return Status::OK();
 }
 
+// Entries are processed independently and results are collected per Entry. This
+// is not an atomic Batch transaction, and the fake does not return key_exist for
+// entries that became full after a successful write.
 Status FakeTransProvider::CompleteBatchStore(NodeId nodeId, const std::uint32_t* request,
                                              std::uint32_t* flagBuffer)
 {

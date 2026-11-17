@@ -237,6 +237,137 @@ bool ApplyTransportDeviceConfigField(TransportConfig& config, const std::string&
     return false;
 }
 
+namespace {
+
+Status ParseRetryUnsigned(const std::string& key, const std::string& value, std::uint64_t maxValue,
+                          std::uint64_t& output)
+{
+    if (value.empty() || value.front() == '-') {
+        return Status::Error(StatusCode::INVALID_ARGUMENT, key + " must be an unsigned integer");
+    }
+    try {
+        std::size_t consumed = 0;
+        const auto parsed = ParseUnsignedConfigValue(value, &consumed);
+        if (consumed != value.size() || parsed > maxValue) {
+            return Status::Error(StatusCode::INVALID_ARGUMENT,
+                                 key + " has an out-of-range unsigned integer");
+        }
+        output = parsed;
+        return Status::OK();
+    } catch (...) {
+        return Status::Error(StatusCode::INVALID_ARGUMENT, key + " has an invalid unsigned integer");
+    }
+}
+
+Status ParseRetryBool(const std::string& key, const std::string& value, bool& output)
+{
+    const auto normalized = ToLower(value);
+    if (normalized == "true" || normalized == "1") {
+        output = true;
+        return Status::OK();
+    }
+    if (normalized == "false" || normalized == "0") {
+        output = false;
+        return Status::OK();
+    }
+    return Status::Error(StatusCode::INVALID_ARGUMENT, key + " must be true/false or 1/0");
+}
+
+Status ParseSelectionPolicy(TransportConfig& config, const std::string& value)
+{
+    const auto normalized = ToLower(value);
+    if (normalized == "round_robin" || normalized == "rr") {
+        config.selectionPolicy = "round_robin";
+        return Status::OK();
+    }
+    if (normalized == "least_loaded" || normalized == "least-loaded" || normalized == "leastloaded") {
+        config.selectionPolicy = "least_loaded";
+        return Status::OK();
+    }
+    return Status::Error(StatusCode::INVALID_ARGUMENT,
+                         "selectionPolicy must be round_robin or least_loaded");
+}
+
+}  // namespace
+
+Status NormalizeChannelFullPolicy(std::string& policy)
+{
+    const auto normalized = ToLower(TrimConfigValue(policy));
+    if (normalized == "fail_fast" || normalized == "fail-fast" || normalized == "failfast") {
+        policy = "fail_fast";
+        return Status::OK();
+    }
+    if (normalized == "flow_wait" || normalized == "flow-wait" || normalized == "flowwait") {
+        policy = "flow_wait";
+        return Status::OK();
+    }
+    return Status::Error(StatusCode::INVALID_ARGUMENT,
+                         "channelFullPolicy must be fail_fast or flow_wait");
+}
+
+Status ApplyTransportRetryConfigField(TransportConfig& config, const std::string& key,
+                                      const std::string& value)
+{
+#define KV_ASSIGN_U32(camel, snake, field)                                                       \
+    if (key == camel || key == snake) {                                                          \
+        std::uint64_t parsed = 0;                                                                \
+        const auto status = ParseRetryUnsigned(key, value, std::numeric_limits<std::uint32_t>::max(), parsed); \
+        if (!status.ok()) { return status; }                                                     \
+        config.field = static_cast<std::uint32_t>(parsed);                                       \
+        return Status::OK();                                                                     \
+    }
+#define KV_ASSIGN_U64(camel, snake, field)                                                       \
+    if (key == camel || key == snake) {                                                          \
+        std::uint64_t parsed = 0;                                                                \
+        const auto status = ParseRetryUnsigned(key, value, std::numeric_limits<std::uint64_t>::max(), parsed); \
+        if (!status.ok()) { return status; }                                                     \
+        config.field = parsed;                                                                   \
+        return Status::OK();                                                                     \
+    }
+#define KV_ASSIGN_BOOL(camel, snake, field)                                                      \
+    if (key == camel || key == snake) {                                                          \
+        bool parsed = false;                                                                     \
+        const auto status = ParseRetryBool(key, value, parsed);                                  \
+        if (!status.ok()) { return status; }                                                     \
+        config.field = parsed;                                                                   \
+        return Status::OK();                                                                     \
+    }
+#define KV_ASSIGN_STRING(camel, snake, field)                                                    \
+    if (key == camel || key == snake) {                                                          \
+        config.field = value;                                                                    \
+        return Status::OK();                                                                     \
+    }
+
+    KV_ASSIGN_U32("busyRetryCount", "busy_retry_count", busyRetryCount)
+    KV_ASSIGN_U32("failoverRetryCount", "failover_retry_count", failoverRetryCount)
+    KV_ASSIGN_U64("busyRetryBackoffMs", "busy_retry_backoff_ms", busyRetryBackoffMs)
+    KV_ASSIGN_BOOL("probeEnabled", "probe_enabled", probeEnabled)
+    KV_ASSIGN_U64("probePeriodMs", "probe_period_ms", probePeriodMs)
+    KV_ASSIGN_U32("probeRetryCount", "probe_retry_count", probeRetryCount)
+    KV_ASSIGN_U64("probeRetryBackoffMs", "probe_retry_backoff_ms", probeRetryBackoffMs)
+    KV_ASSIGN_U32("probeMaxInflight", "probe_max_inflight", probeMaxInflight)
+    KV_ASSIGN_U32("probeMaxSubmissionsPerRound", "probe_max_submissions_per_round", probeMaxSubmissionsPerRound)
+    KV_ASSIGN_U32("probeTransportScanBudget", "probe_transport_scan_budget", probeTransportScanBudget)
+    KV_ASSIGN_U32("probeChannelScanBudgetPerTransport", "probe_channel_scan_budget_per_transport", probeChannelScanBudgetPerTransport)
+    KV_ASSIGN_U64("probeTimeoutMs", "probe_timeout_ms", probeTimeoutMs)
+    KV_ASSIGN_BOOL("flowControlEnabled", "flow_control_enabled", flowControlEnabled)
+    KV_ASSIGN_STRING("channelFullPolicy", "channel_full_policy", channelFullPolicy)
+    KV_ASSIGN_U32("busyFloor", "busy_floor", busyFloor)
+    KV_ASSIGN_U64("stableSuccessMs", "stable_success_ms", stableSuccessMs)
+    KV_ASSIGN_U32("maxInflightPerChannel", "max_inflight_per_channel", maxInflightPerChannel)
+    KV_ASSIGN_U32("connectRetryPerRound", "connect_retry_per_round", connectRetryPerRound)
+    KV_ASSIGN_U64("recoverInitialBackoffMs", "recover_initial_backoff_ms", recoverInitialBackoffMs)
+    KV_ASSIGN_U64("recoverMaxBackoffMs", "recover_max_backoff_ms", recoverMaxBackoffMs)
+
+    if (key == "selectionPolicy" || key == "selection_policy") { return ParseSelectionPolicy(config, value); }
+    return Status::Error(StatusCode::UNSUPPORTED, "unsupported retry config field: " + key);
+
+#undef KV_ASSIGN_U32
+#undef KV_ASSIGN_U64
+#undef KV_ASSIGN_BOOL
+#undef KV_ASSIGN_STRING
+}
+
 NodeEndpoint ParseTransportEndpoint(const std::string& value)
 {
     NodeEndpoint endpoint;

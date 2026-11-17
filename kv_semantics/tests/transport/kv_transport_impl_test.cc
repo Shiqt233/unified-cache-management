@@ -196,6 +196,7 @@ TEST_F(TransportTaskCompletionTest, FailureCqeAccumulatesWithoutSuccessReset)
     auto ctx = std::make_shared<TransportTask>();
     ctx->state.store(TransportTaskState::INFLIGHT, std::memory_order_release);
     ctx->subBatchContexts->resize(1);
+    ctx->remainingSubBatchCount = 1;
 
     auto& subBatchContext = (*ctx->subBatchContexts)[0];
     subBatchContext.cid = 123;
@@ -214,6 +215,15 @@ TEST_F(TransportTaskCompletionTest, FailureCqeAccumulatesWithoutSuccessReset)
 
     EXPECT_EQ(channel->GetErrorCount(), std::uint32_t{2});
     EXPECT_EQ(channel->GetState(), ChannelState::ACTIVE);
+    EXPECT_EQ(subBatchContext.status.code, StatusCode::IN_PROGRESS);
+    EXPECT_TRUE(subBatchContext.retryState.retryPending);
+    EXPECT_FALSE(ctx->Done());
+
+    // The only channel was already attempted, so failover cannot select another
+    // candidate. The final subBatch retains the original timeout status.
+    EXPECT_TRUE(transport_->taskExecutor_->ExecuteRetry(ctx));
+    EXPECT_TRUE(ctx->Done());
+    EXPECT_FALSE(subBatchContext.retryState.retryPending);
     EXPECT_EQ(subBatchContext.status.code, StatusCode::CQE_IO_TIMEOUT);
 }
 
@@ -395,6 +405,22 @@ TEST_F(TransportTaskCompletionTest, TryFinalizeAggregatesSuccessAndFailure)
 
     EXPECT_EQ(successCtx.state.load(std::memory_order_acquire), TransportTaskState::COMPLETED);
     EXPECT_TRUE(successCtx.finalStatus.ok());
+}
+
+TEST_F(TransportTaskCompletionTest, TryFinalizeRetainsSubBatchErrorWhenEntriesAreStillOk)
+{
+    TransportTask ctx;
+    ctx.subBatchContexts->resize(1);
+    auto& subBatch = (*ctx.subBatchContexts)[0];
+    subBatch.state = TransportSubBatchState::COMPLETED;
+    subBatch.status = Status::Error(StatusCode::INVALID_ARGUMENT, "response decode failed");
+    subBatch.entryStatus = {Status::OK()};
+    ctx.remainingSubBatchCount = 0;
+
+    ctx.TryFinalizeFromSubBatches();
+
+    EXPECT_EQ(ctx.state.load(std::memory_order_acquire), TransportTaskState::COMPLETED);
+    EXPECT_EQ(ctx.finalStatus.code, StatusCode::PARTIAL_FAILED);
 }
 
 TEST_F(TransportTaskCompletionTest, NotifyCompletionPassesResultOnce)
@@ -667,6 +693,134 @@ TEST_F(TransportTaskCompletionTest, ShutdownReleasesResourcesBeforeInvokingCallb
     EXPECT_TRUE(resourcesReleased);
     EXPECT_TRUE(entryCanceled);
     EXPECT_EQ(transport_->taskManager_.Get(taskId), nullptr);
+}
+
+TEST_F(TransportTaskCompletionTest, CidExhaustionRejectsRequestBeforePacking)
+{
+    auto& executor = *transport_->taskExecutor_;
+    for (std::uint32_t cid = 1; cid <= 65535; ++cid) {
+        executor.activeCids_.insert(static_cast<std::uint16_t>(cid));
+    }
+    TransportTask task;
+    task.opType = AsuOpType::BATCH_STORE;
+    task.entries.resize(1);
+    task.entries[0].key[0] = std::byte{1};
+    task.entries[0].buffer.region.addr = 0x1000;
+    task.entries[0].buffer.region.size = 512;
+    task.entries[0].buffer.handle = 1;
+    task.entries[0].mrKey = 1;
+    task.entryStatus.assign(1, Status::OK());
+    task.originalIndices = {0};
+
+    std::vector<TransportSubBatchContext> contexts;
+    const auto status = executor.PrepareTaskSubBatches(task, contexts);
+    EXPECT_EQ(status.code, StatusCode::RESOURCE_BUSY);
+    ASSERT_EQ(contexts.size(), std::size_t{1});
+    EXPECT_EQ(contexts[0].status.code, StatusCode::RESOURCE_BUSY);
+}
+
+TEST_F(TransportTaskCompletionTest, CidAllocatorSkipsActiveCidsAcrossWrap)
+{
+    auto& executor = *transport_->taskExecutor_;
+    executor.nextRequestCid_.store(65535);
+    const auto first = executor.AllocateRequestCid(101);
+    const auto second = executor.AllocateRequestCid(102);
+    EXPECT_EQ(first, std::uint16_t{65535});
+    EXPECT_EQ(second, std::uint16_t{1});
+    EXPECT_EQ(executor.cidToAttemptId_[first], std::uint64_t{101});
+    EXPECT_EQ(executor.cidToAttemptId_[second], std::uint64_t{102});
+
+    executor.ReleaseRequestCid(first);
+    executor.nextRequestCid_.store(65535);
+    EXPECT_EQ(executor.AllocateRequestCid(103), std::uint16_t{65535});
+}
+
+TEST_F(TransportTaskCompletionTest, CidAllocatorReturnsZeroWhenNamespaceExhausted)
+{
+    auto& executor = *transport_->taskExecutor_;
+    for (std::uint32_t cid = 1; cid <= 65535; ++cid) {
+        executor.activeCids_.insert(static_cast<std::uint16_t>(cid));
+    }
+    EXPECT_EQ(executor.AllocateRequestCid(1), std::uint16_t{0});
+}
+
+TEST_F(TransportTaskCompletionTest, ReleaseSubBatchResourcesQuarantinesUnconfirmedSlots)
+{
+    auto& executor = *transport_->taskExecutor_;
+    TransportSubBatchContext subBatch;
+    subBatch.currentAttempt.sendAttempted = true;
+    subBatch.currentAttempt.responseConfirmed = false;
+    subBatch.currentAttempt.attemptId = 77;
+    subBatch.currentAttempt.requestCid = executor.AllocateRequestCid(77);
+    subBatch.cid = subBatch.currentAttempt.requestCid;
+    subBatch.currentAttempt.mrLease = std::make_shared<MRLifecycleLease>();
+    subBatch.currentAttempt.mrLease->handles.insert(1);
+    ASSERT_TRUE(executor.sendBufferManager_.Allocate(64, subBatch.sendSge).ok());
+    ASSERT_TRUE(executor.flagBufferManager_.Allocate(64, subBatch.flagBuffer).ok());
+    const auto sendSlot = subBatch.sendSge.slot_index;
+    const auto flagSlot = subBatch.flagBuffer.slot_index;
+
+    executor.ReleaseSubBatchResources(subBatch);
+
+    EXPECT_TRUE(executor.sendBufferManager_.IsQuarantined(sendSlot));
+    EXPECT_TRUE(executor.flagBufferManager_.IsQuarantined(flagSlot));
+    EXPECT_TRUE(executor.activeCids_.find(subBatch.cid) != executor.activeCids_.end());
+    EXPECT_TRUE(subBatch.currentAttempt.mrLease->quarantined);
+    EXPECT_TRUE(transport_->HasInflightMemory(1));
+    ScatterGatherEntry other;
+    ASSERT_TRUE(executor.sendBufferManager_.Allocate(64, other).ok());
+    EXPECT_NE(other.slot_index, sendSlot);
+    ASSERT_TRUE(executor.sendBufferManager_.Free(other.slot_index).ok());
+
+    executor.ReleaseQuarantinedSlots();
+    EXPECT_FALSE(transport_->HasInflightMemory(1));
+    EXPECT_FALSE(executor.sendBufferManager_.IsQuarantined(sendSlot));
+    EXPECT_FALSE(executor.flagBufferManager_.IsQuarantined(flagSlot));
+    ScatterGatherEntry reused;
+    ASSERT_TRUE(executor.sendBufferManager_.Allocate(64, reused).ok());
+    EXPECT_EQ(reused.slot_index, sendSlot);
+    ASSERT_TRUE(executor.sendBufferManager_.Free(reused.slot_index).ok());
+}
+
+TEST_F(TransportTaskCompletionTest, ReleaseSubBatchResourcesFreesConfirmedSlots)
+{
+    auto& executor = *transport_->taskExecutor_;
+    TransportSubBatchContext subBatch;
+    subBatch.currentAttempt.sendAttempted = true;
+    subBatch.currentAttempt.responseConfirmed = true;
+    subBatch.currentAttempt.requestCid = executor.AllocateRequestCid(88);
+    subBatch.cid = subBatch.currentAttempt.requestCid;
+    ASSERT_TRUE(executor.sendBufferManager_.Allocate(64, subBatch.sendSge).ok());
+    ASSERT_TRUE(executor.flagBufferManager_.Allocate(64, subBatch.flagBuffer).ok());
+    const auto sendSlot = subBatch.sendSge.slot_index;
+    const auto flagSlot = subBatch.flagBuffer.slot_index;
+    executor.ReleaseConfirmedCid(subBatch.cid);
+
+    executor.ReleaseSubBatchResources(subBatch);
+
+    EXPECT_FALSE(executor.sendBufferManager_.IsQuarantined(sendSlot));
+    EXPECT_FALSE(executor.flagBufferManager_.IsQuarantined(flagSlot));
+    EXPECT_TRUE(executor.activeCids_.empty());
+}
+
+TEST(TransportHealthSnapshotTest, ReportsCurrentChannelsAndRejectsAfterShutdown)
+{
+    AsuTransportImpl transport;
+    auto provider = std::make_shared<StubTransProvider>();
+    TransportConfig config;
+    config.endpoints = {NodeEndpoint{}};
+    config.qpNum = 2;
+    config.timeoutMs = 1000;
+    config.completionPollSpinLimit = 1;
+    ASSERT_TRUE(transport.Init(config, provider).ok());
+
+    NodeHealthSnapshot snapshot;
+    ASSERT_TRUE(transport.GetConnectionHealth(snapshot).ok());
+    EXPECT_EQ(snapshot.health, NodeHealth::GREEN);
+    EXPECT_EQ(snapshot.activeCount, std::uint32_t{2});
+    EXPECT_TRUE(transport.CheckHealth().ok());
+    ASSERT_TRUE(transport.Shutdown().ok());
+    EXPECT_EQ(transport.GetConnectionHealth(snapshot).code, StatusCode::NOT_INITIALIZED);
 }
 
 }  // namespace

@@ -33,6 +33,9 @@ constexpr int kAsuDeleteEntryStatusBase = 0x0200;
 constexpr int kAsuExistEntryStatusBase = 0x0300;
 constexpr int kAsuCqeStatusBase = 0x10000;
 
+// Keep protocol result namespaces separate from generic client StatusCode values.
+// Batch/Delete/Exist entries use different high bits; their raw low-byte values
+// must not be confused with CQE statuses or with client-generated UNKNOWN.
 StatusCode EntryStatusCode(AsuOpType opType, std::uint8_t rawResult)
 {
     if (opType == AsuOpType::BATCH_STORE || opType == AsuOpType::BATCH_LOAD) {
@@ -52,6 +55,9 @@ StatusCode CqeStatusCode(std::uint16_t rawStatus)
     return static_cast<StatusCode>(kAsuCqeStatusBase | rawStatus);
 }
 
+// Decode one raw result-buffer value into the corresponding protocol Entry status.
+// This function does not decide retry or idempotence; ErrorClassifier performs that
+// step after all Entry statuses are available.
 Status ResultBufferEntryToStatus(AsuOpType opType, std::uint8_t rawResult)
 {
     if (opType != AsuOpType::QUERY && rawResult == 0x00) { return Status::OK(); }
@@ -101,6 +107,9 @@ Status ResultBufferEntryToStatus(AsuOpType opType, std::uint8_t rawResult)
 
 }  // namespace
 
+// Convert a raw CQE status without changing its application meaning. In particular,
+// 0x723 remains CQE_KEY_ALREADY_EXISTED (a full/rejected STORE), while
+// CQE_CHECK_RESULT_BUFFER remains a wrapper and is decoded into Entry statuses next.
 Status KvResponseStatusToSubBatchStatus(std::uint16_t rawStatus)
 {
     if (rawStatus == 0x00) { return Status::OK(); }
@@ -136,6 +145,9 @@ Status KvResponseStatusToSubBatchStatus(std::uint16_t rawStatus)
     }
 }
 
+// Expand a CQE into per-Entry statuses. A mixed Batch must provide a result buffer;
+// without one, a shared non-OK subBatch status is applied to every Entry. Query
+// hit/miss remains normal only for QUERY, while STORE errors stay application errors.
 void FillEntryStatusFromCqeResult(const KvResponse& response, AsuOpType opType, bool useSeekControl,
                                   Status& status, std::vector<Status>& entryStatus)
 {

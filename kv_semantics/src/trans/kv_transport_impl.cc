@@ -30,10 +30,12 @@
 #include <thread>
 #include <utility>
 #include "conn/connection_manager.h"
+#include "task/probe_scheduler.h"
 #include "kv_transport.h"
 #include "logger.h"
 #include "trans_provider.h"
 #include "utils/trans_config_utils.h"
+#include "utils/parser_common.h"
 
 namespace kv {
 
@@ -70,6 +72,10 @@ Status AsuTransportImpl::Init(const TransportConfig& config,
     }
     config_ = config;
     transProvider_ = std::move(transProvider);
+    if (const auto policyStatus = NormalizeChannelFullPolicy(config_.channelFullPolicy);
+        !policyStatus.ok()) {
+        return policyStatus;
+    }
     if (config_.maxErrorCount == 0) {
         return Status::Error(StatusCode::INVALID_ARGUMENT, "maxErrorCount must be greater than 0");
     }
@@ -77,6 +83,8 @@ Status AsuTransportImpl::Init(const TransportConfig& config,
         return Status::Error(StatusCode::INVALID_ARGUMENT,
                              "completionPollSpinLimit must be greater than 0");
     }
+    const auto probeStatus = ValidateProbeConfig(config_);
+    if (!probeStatus.ok()) { return probeStatus; }
 
     if (!transProvider_) {
         KV_ERROR("AsuTransportImpl::Init: TransProvider is null");
@@ -96,6 +104,23 @@ Status AsuTransportImpl::Init(const TransportConfig& config,
     connManager_.reset();
     connManager_ = std::make_unique<ConnectionManager>(*transProvider_, localIp, timeout,
                                                        config_.maxErrorCount);
+    connManager_->ConfigureFlow(config_.flowControlEnabled, config_.busyFloor,
+                                config_.stableSuccessMs);
+    connManager_->ConfigureRecovery(config_.connectRetryPerRound, config_.recoverInitialBackoffMs,
+                                    config_.recoverMaxBackoffMs);
+    if (config_.maxInflightPerChannel == 0) {
+        return Status::Error(StatusCode::INVALID_ARGUMENT,
+                             "maxInflightPerChannel must be greater than 0");
+    }
+    connManager_->SetMaxInflightPerChannel(config_.maxInflightPerChannel);
+    if (config_.selectionPolicy == "least_loaded") {
+        connManager_->SetRoutingPolicy(RoutingPolicy::LEAST_LOADED);
+    } else if (config_.selectionPolicy == "round_robin") {
+        connManager_->SetRoutingPolicy(RoutingPolicy::ROUND_ROBIN);
+    } else {
+        return Status::Error(StatusCode::INVALID_ARGUMENT,
+                             "selectionPolicy must be round_robin or least_loaded");
+    }
 
     const std::uint32_t qp_num = config_.qpNum;
     KV_DEBUG("AsuTransportImpl::Init endpoints={} qp_num={}", config_.endpoints.size(), qp_num);
@@ -193,10 +218,12 @@ Status AsuTransportImpl::Shutdown()
     stopCompletionWorker_.store(true, std::memory_order_release);
     if (completionWorker_.joinable()) { completionWorker_.join(); }
 
-    for (const auto& ctx : taskManager_.GetAll()) {
-        if (ctx == nullptr) { continue; }
-        if (!taskExecutor_->Cancel(ctx)) { continue; }
-        taskManager_.NotifyCompletion(ctx);
+    if (taskExecutor_) {
+        for (const auto& ctx : taskManager_.GetAll()) {
+            if (ctx == nullptr) { continue; }
+            if (!taskExecutor_->Cancel(ctx)) { continue; }
+            taskManager_.NotifyCompletion(ctx);
+        }
     }
     for (const auto& ctx : taskManager_.GetAll()) {
         if (ctx != nullptr) { (void)taskManager_.Remove(ctx->taskId); }
@@ -228,12 +255,25 @@ Status AsuTransportImpl::CheckHealth()
     return Status::OK();
 }
 
+Status AsuTransportImpl::GetConnectionHealth(NodeHealthSnapshot& snapshot)
+{
+    if (!connManager_ || !worker_.joinable() || !completionWorker_.joinable()) {
+        return Status::Error(StatusCode::NOT_INITIALIZED, "transport worker is not running");
+    }
+    return connManager_->GetHealthSnapshot(snapshot);
+}
+
 Status AsuTransportImpl::Submit(const TransportTaskPtr& task)
 {
     if (!task) { return Status::Error(StatusCode::INVALID_ARGUMENT, "transport task is null"); }
     const auto entryCount = IsEntryBatchOp(task->opType) ? task->entries.size() : task->keys.size();
     task->entryStatus.assign(entryCount, Status::OK());
-    task->deadline = TaskDeadline(config_.timeoutMs);
+    // A scheduler-owned PROBE task carries an independent finite deadline. Business tasks
+    // retain the historical transport timeout behavior.
+    if (task->origin != TaskOrigin::PROBE ||
+        task->deadline == std::chrono::steady_clock::time_point::max()) {
+        task->deadline = TaskDeadline(config_.timeoutMs);
+    }
     return SubmitTask(task);
 }
 
@@ -241,10 +281,34 @@ Status AsuTransportImpl::Cancel(TaskId taskId)
 {
     auto ctx = taskManager_.Get(taskId);
     if (!ctx) { return Status::Error(StatusCode::TASK_NOT_FOUND, "transport task not found"); }
+    if (!taskExecutor_) {
+        return Status::Error(StatusCode::NOT_INITIALIZED, "transport task executor is not ready");
+    }
 
     if (!taskExecutor_->Cancel(ctx)) { return Status::OK(); }
     taskManager_.NotifyCompletion(ctx);
     return Status::OK();
+}
+
+bool AsuTransportImpl::HasInflightMemory(MRHandle handle)
+{
+    if (handle == kInvalidMRHandle) { return false; }
+    if (taskExecutor_ != nullptr && taskExecutor_->HasQuarantinedMemory(handle)) { return true; }
+    for (const auto& task : taskManager_.GetAll()) {
+        if (!task || (task->Done() && task->finalStatus.ok())) { continue; }
+        for (const auto& entry : task->entries) {
+            if (entry.buffer.handle == handle) { return true; }
+        }
+        if (task->subBatchContexts != nullptr) {
+            for (const auto& subBatch : *task->subBatchContexts) {
+                const auto& lease = subBatch.currentAttempt.mrLease;
+                if (lease != nullptr && lease->handles.find(handle) != lease->handles.end()) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 Status AsuTransportImpl::SubmitTask(const TransportTaskPtr& task)
@@ -297,7 +361,10 @@ void AsuTransportImpl::CompletionLoop()
 
         bool completedTask = false;
         for (const auto& ctx : tasks) {
-            if (taskExecutor_->Poll(ctx)) {
+            bool done = false;
+            if (taskExecutor_->HasRetryWork(ctx)) { done = taskExecutor_->ExecuteRetry(ctx); }
+            if (!done) { done = taskExecutor_->Poll(ctx); }
+            if (done) {
                 taskManager_.NotifyCompletion(ctx);
                 completedTask = true;
             }

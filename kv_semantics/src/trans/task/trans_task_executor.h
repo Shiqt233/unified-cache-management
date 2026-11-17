@@ -27,12 +27,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <set>
+#include <unordered_map>
 #include <vector>
 #include "buffer/buffer_manager.h"
 #include "conn/connection_manager.h"
 #include "kv_metrics/metrics.h"
 #include "proto/kv_protocol.h"
 #include "task/io_scheduler.h"
+#include "task/retry_controller.h"
 #include "task/trans_task_manager.h"
 #include "trans_provider.h"
 
@@ -67,11 +70,18 @@ public:
     bool Execute(const TransportTaskPtr& task);
     bool Poll(const TransportTaskPtr& task);
     bool Cancel(const TransportTaskPtr& task);
+    bool HasRetryWork(const TransportTaskPtr& task) const;
+    bool ExecuteRetry(const TransportTaskPtr& task);
+    bool HasQuarantinedMemory(MRHandle handle) const;
 
 private:
     Status RegisterBufferMemory(BufferManager& bufferManager, MRHandle& mrHandle);
     Status UnregisterBufferMemory(MRHandle& mrHandle);
-    std::uint16_t AllocateRequestCid();
+    std::uint16_t AllocateRequestCid(std::uint64_t attemptId = 0);
+    void BindAttemptCid(std::uint16_t cid, std::uint64_t attemptId);
+    void ReleaseRequestCid(std::uint16_t cid);
+    void ReleaseConfirmedCid(std::uint16_t cid) { ReleaseRequestCid(cid); }
+    void ReleaseQuarantinedSlots();
 
     Status PrepareTaskSubBatches(const TransportTask& task,
                                  std::vector<TransportSubBatchContext>& subBatchContexts);
@@ -83,11 +93,19 @@ private:
                                     TransportSubBatchContext& subBatchContext);
     Status SubmitKeepAliveRequest(TransportSubBatchContext& subBatchContext);
 
-    Status AssignSubBatchConnections(std::vector<TransportSubBatchContext>& subBatchContexts);
+    Status AssignSubBatchConnections(TransportTask& task,
+                                     std::vector<TransportSubBatchContext>& subBatchContexts);
     void BuildSubBatchSendBuffers(std::vector<TransportSubBatchContext>& subBatchContexts,
                                   std::vector<TransProvider::SendIoBatch>& ioBatches);
     void SendSubBatchBuffers(std::vector<TransportSubBatchContext>& subBatchContexts,
                              const std::vector<TransProvider::SendIoBatch>& ioBatches);
+    void SendSubBatchBuffers(TransportTask& task,
+                             const std::vector<TransProvider::SendIoBatch>& ioBatches);
+    Status PrepareRetryRequest(TransportSubBatchContext& subBatchContext);
+    Status SendSingleAttempt(TransportSubBatchContext& subBatchContext);
+    bool HandleAttemptFailure(TransportTask& task, TransportSubBatchContext& subBatchContext,
+                              const Status& status, ErrorOrigin origin);
+    bool AnySending(const TransportTask& task) const;
 
     void AbortSubBatchesBeforeSend(TransportTask& task,
                                    std::vector<TransportSubBatchContext>& subBatchContexts);
@@ -105,7 +123,15 @@ private:
     MRHandle flagBufferMrHandle_{kInvalidMRHandle};
     ProtocolManager protocolManager_;
     const std::unique_ptr<ConnectionManager>& connManager_;
+    RetryController retryController_;
     std::atomic<std::uint16_t> nextRequestCid_{1};
+    std::atomic<std::uint64_t> nextAttemptId_{1};
+    mutable std::mutex cidMu_;
+    std::set<std::uint16_t> activeCids_;
+    std::unordered_map<std::uint16_t, std::uint64_t> cidToAttemptId_;
+    std::set<std::uint32_t> quarantinedSendSlots_;
+    std::set<std::uint32_t> quarantinedFlagSlots_;
+    std::set<MRHandle> quarantinedMrHandles_;
     metrics::CachedMetric asuSendMetric_;
     metrics::CachedMetric asuCompletionMetric_;
 };

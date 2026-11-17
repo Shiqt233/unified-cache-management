@@ -85,6 +85,7 @@ struct TestState {
     std::vector<NodeId> loadCalls;
     std::vector<NodeId> storeCalls;
     std::vector<AsuOpType> submittedOpTypes;
+    TransportTaskPtr lastSubmittedTask;
     std::vector<NodeId> deleteCalls;
     std::vector<NodeId> cancelCalls;
     std::unordered_map<NodeId, TaskId> childTaskIds;
@@ -250,6 +251,7 @@ public:
             return Status::Error(StatusCode::INVALID_ARGUMENT, "fake transport task is null");
         }
         state_->submittedEntries = task->entries;
+        state_->lastSubmittedTask = task;
         state_->submittedOpTypes.emplace_back(task->opType);
         switch (task->opType) {
             case AsuOpType::QUERY: {
@@ -2320,6 +2322,86 @@ TEST(KvClientImplTest,
     TaskResult secondTaskResult;
     EXPECT_TRUE(client->Wait(taskId, 100, secondTaskResult).ok());
     EXPECT_EQ(state->storeCalls, std::vector<NodeId>({20, 10}));
+}
+
+TEST(KvClientImplTest, MemoryRegister_UnregisterRejectsInflightTaskAndAllowsAfterCompletion)
+{
+    auto state = std::make_shared<TestState>();
+    state->deferCompletionCallbacks = true;
+    auto client = CreateKvClient(MakeFactory(state), MakeProviderFactory(state));
+    ASSERT_TRUE(client->Init(MakeConfig({10})).ok());
+
+    std::vector<RegisteredMemory> regions;
+    ASSERT_TRUE(client->RegisterRegions({MemoryRegion{}}, regions).ok());
+    KVBuffer entry{MakeCacheKey("k05"), {}};
+    entry.buffer.handle = regions[0].handle;
+
+    TaskId taskId = 0;
+    ASSERT_TRUE(client->StoreAsync({entry}, taskId).ok());
+    ASSERT_TRUE(WaitForPendingCompletion(state, 10));
+
+    const auto busyStatus = client->UnregisterRegions({regions[0].handle});
+    EXPECT_EQ(busyStatus.code, StatusCode::RESOURCE_BUSY);
+
+    TaskResult completion;
+    completion.status = Status::OK();
+    completion.entryStatus = {Status::OK()};
+    ASSERT_TRUE(InvokePendingCompletion(state, 10, std::move(completion)));
+    EXPECT_TRUE(client->UnregisterRegions({regions[0].handle}).ok());
+    EXPECT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, WaitTimeoutMarksInflightTransportTaskCanceled)
+{
+    auto state = std::make_shared<TestState>();
+    state->deferCompletionCallbacks = true;
+    auto client = CreateKvClient(MakeFactory(state));
+    ASSERT_TRUE(client->Init(MakeConfig({10})).ok());
+
+    TaskId taskId = kInvalidTaskId;
+    ASSERT_TRUE(client->QueryAsync({MakeCacheKey("k15")}, taskId).ok());
+    ASSERT_TRUE(WaitForPendingCompletion(state, 10));
+    ASSERT_NE(state->lastSubmittedTask, nullptr);
+    TaskResult result;
+    EXPECT_EQ(client->Wait(taskId, 0, result).code, StatusCode::TIMEOUT);
+    EXPECT_TRUE(state->lastSubmittedTask->cancelRequested.load(std::memory_order_acquire));
+    EXPECT_TRUE(client->Shutdown().ok());
+}
+
+TEST(KvClientImplTest, WaitTimeoutCancelsQueuedClientTaskBeforeDispatch)
+{
+    auto state = std::make_shared<TestState>();
+    state->blockStoreDispatch = true;
+    auto client = CreateKvClient(MakeFactory(state));
+    auto config = MakeConfig({10});
+    config.maxInflightTasks = 4;
+    ASSERT_TRUE(client->Init(config).ok());
+
+    const std::vector<KVBuffer> firstEntries{KVBuffer{MakeCacheKey("first"), {}}};
+    const std::vector<KVBuffer> secondEntries{KVBuffer{MakeCacheKey("second"), {}}};
+    TaskId firstId = kInvalidTaskId;
+    TaskId secondId = kInvalidTaskId;
+    ASSERT_TRUE(client->StoreAsync(firstEntries, firstId).ok());
+    {
+        std::unique_lock<std::mutex> lock{state->storeDispatchMu};
+        ASSERT_TRUE(state->storeDispatchCv.wait_for(lock, std::chrono::milliseconds(100),
+                                                    [&] { return state->storeDispatchStarted; }));
+    }
+    ASSERT_TRUE(client->StoreAsync(secondEntries, secondId).ok());
+
+    TaskResult timeoutResult;
+    EXPECT_EQ(client->Wait(secondId, 0, timeoutResult).code, StatusCode::TIMEOUT);
+    {
+        std::lock_guard<std::mutex> lock{state->storeDispatchMu};
+        state->releaseStoreDispatch = true;
+    }
+    state->storeDispatchCv.notify_all();
+
+    TaskResult firstResult;
+    ASSERT_TRUE(client->Wait(firstId, 1000, firstResult).ok());
+    EXPECT_EQ(state->submittedOpTypes.size(), std::size_t{1});
+    EXPECT_EQ(state->storeCalls.size(), std::size_t{1});
+    EXPECT_TRUE(client->Shutdown().ok());
 }
 
 }  // namespace kv::test

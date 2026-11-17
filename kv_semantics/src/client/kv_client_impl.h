@@ -38,6 +38,9 @@
 #include "view/view_server.h"
 
 namespace kv {
+
+class ClientProbeScheduler;
+
 class Router;
 }  // namespace kv
 
@@ -121,6 +124,7 @@ private:
     // Creates and initializes a transport for one ASU.
     Status BuildTransport(NodeId nodeId, const NodeInfo& asuInfo,
                           std::shared_ptr<AsuTransport>& transport);
+    TransportConfig BuildProbeConfig() const;
     Status BindProviderRegions(const std::shared_ptr<TransProvider>& transProvider,
                                const std::vector<RegisteredMemory>& registeredRegions,
                                std::vector<MRHandle>& localHandles);
@@ -184,6 +188,8 @@ private:
     std::unordered_map<MRHandle, RegisteredMemory> registeredRegions_;
     // Current immutable routing and transport snapshot.
     std::shared_ptr<ViewSnapshot> snapshot_;
+    // One shared probe scheduler per client; never created per ASU transport.
+    std::unique_ptr<ClientProbeScheduler> probeScheduler_;
     // Transports removed from the active snapshot but still needed by old tasks.
     std::vector<std::shared_ptr<AsuTransport>> retiredTransports_;
     // Worker used for non-blocking refresh requests.
