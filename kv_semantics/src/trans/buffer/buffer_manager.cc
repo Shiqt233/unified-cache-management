@@ -195,6 +195,10 @@ Status BufferManager::Free(std::uint32_t slot_index)
     if (slot_index >= slot_num_) {
         return Status::Error(StatusCode::INVALID_ARGUMENT, name_ + ": slot_index out of range");
     }
+    // Do not clear a slot that may still be written by a late provider response.
+    if (index_pool_.IsQuarantined(static_cast<IndexPool::Index>(slot_index))) {
+        return Status::OK();
+    }
     auto* p = static_cast<char*>(region_.localAddr) + slot_index * slot_stride_;
     if (memory_type_ == MemoryType::DEVICE) {
         if (const auto memStatus = runtime::Memset(p, slot_stride_, 0); !memStatus.ok()) {
@@ -205,6 +209,35 @@ Status BufferManager::Free(std::uint32_t slot_index)
     }
     index_pool_.Release(static_cast<IndexPool::Index>(slot_index));
     return Status::OK();
+}
+
+Status BufferManager::Quarantine(std::uint32_t slot_index)
+{
+    if (!region_) { return Status::Error(StatusCode::NOT_INITIALIZED, name_ + " not initialized"); }
+    if (slot_index >= slot_num_) {
+        return Status::Error(StatusCode::INVALID_ARGUMENT, name_ + ": slot_index out of range");
+    }
+    if (!index_pool_.Quarantine(static_cast<IndexPool::Index>(slot_index))) {
+        return Status::Error(StatusCode::INVALID_ARGUMENT, name_ + ": slot is not allocated");
+    }
+    return Status::OK();
+}
+
+Status BufferManager::ReleaseQuarantined(std::uint32_t slot_index)
+{
+    if (!region_) { return Status::Error(StatusCode::NOT_INITIALIZED, name_ + " not initialized"); }
+    if (slot_index >= slot_num_) {
+        return Status::Error(StatusCode::INVALID_ARGUMENT, name_ + ": slot_index out of range");
+    }
+    if (!index_pool_.ReleaseQuarantined(static_cast<IndexPool::Index>(slot_index))) {
+        return Status::Error(StatusCode::INVALID_ARGUMENT, name_ + ": slot is not quarantined");
+    }
+    return Status::OK();
+}
+
+bool BufferManager::IsQuarantined(std::uint32_t slot_index) const
+{
+    return index_pool_.IsQuarantined(static_cast<IndexPool::Index>(slot_index));
 }
 
 bool BufferManager::IsValidPointer(const void* ptr) const

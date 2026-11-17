@@ -46,11 +46,15 @@ constexpr TaskId kInvalidTaskId = 0;
 constexpr MRHandle kInvalidMRHandle = 0;
 
 enum class StatusCode {
+    // For a server IO operation, OK confirms that the current write was accepted.
+    // For STORE it does not, by itself, prove that the key's complete range is full.
     OK = 0,
     INVALID_ARGUMENT,
     NOT_INITIALIZED,
+    // Waiting or task deadline expired. This is not equivalent to an unknown server outcome.
     TIMEOUT,
     NOT_FOUND,
+    // Aggregate result, not a protocol error and not proof of partial byte writes.
     PARTIAL_FAILED,
     CONNECTION_ERROR,
     IO_ERROR,
@@ -64,6 +68,9 @@ enum class StatusCode {
     CANCELED,
 
     // Entry status codes keep raw entry result values in the low byte.
+    // These ENTRY_* values belong to protocol result buffers, not to the generic
+    // transport error categories. ENTRY_KEY_EXIST is a normal Query hit, not a
+    // STORE "range full" response.
     ENTRY_RETRY_ADVISED = 0x0100 | 0x01,
     ENTRY_NO_RETRY_ADVISED = 0x0100 | 0x02,
     ENTRY_KEY_NOT_FOUND = 0x0100 | 0x03,
@@ -79,9 +86,16 @@ enum class StatusCode {
     CQE_UNRECOVERED_READ_ERROR = 0x10000 | 0x281,
     CQE_KEY_NOT_EXIST = 0x10000 | 0x701,
     CQE_OUT_OF_CREATE_SIZE = 0x10000 | 0x712,
+    // Raw protocol timeout. It follows the normal link-failure failover policy;
+    // retry exhaustion returns the original protocol/aggregate error.
     CQE_IO_TIMEOUT = 0x10000 | 0x716,
+    // STORE application response: the key's range is full (or a create-only key already
+    // exists), so the current write is rejected. This is not a link failure or an
+    // outcome-unknown result and must not be silently converted to OK.
     CQE_KEY_ALREADY_EXISTED = 0x10000 | 0x723,
+    // Remote busy is distinct from local RESOURCE_BUSY and has its own retry policy.
     CQE_RESOURCE_BUSY = 0x10000 | 0x731,
+    // Batch wrapper: decode per-entry results before selecting a retry strategy.
     CQE_CHECK_RESULT_BUFFER = 0x10000 | 0x732,
 };
 
@@ -134,6 +148,9 @@ struct RegisteredMemory {
     std::uint32_t tokenId{0};
 };
 
+// status is the aggregate task result; entryStatus preserves per-entry application
+// and protocol results. PARTIAL_FAILED is only an aggregation label: it does not
+// prove that a value was partially written, nor does it replace individual statuses.
 struct TaskResult {
     Status status;
     std::vector<Status> entryStatus;
@@ -179,6 +196,30 @@ struct TransportConfig {
 
     std::uint64_t timeoutMs{100};
     std::uint32_t maxErrorCount{2};
+    // Extra attempts after the first subBatch attempt. Zero disables that retry type.
+    std::uint32_t busyRetryCount{2};
+    std::uint32_t failoverRetryCount{2};
+    std::uint64_t busyRetryBackoffMs{1};
+    // KeepAlive probing is opt-in so existing business behavior is unchanged.
+    bool probeEnabled{false};
+    std::uint64_t probePeriodMs{1000};
+    std::uint32_t probeRetryCount{0};
+    std::uint64_t probeRetryBackoffMs{5};
+    std::uint32_t probeMaxInflight{64};
+    std::uint32_t probeMaxSubmissionsPerRound{16};
+    std::uint32_t probeTransportScanBudget{8};
+    std::uint32_t probeChannelScanBudgetPerTransport{32};
+    std::uint64_t probeTimeoutMs{1000};
+    bool flowControlEnabled{false};
+    // fail_fast preserves existing behavior; flow_wait waits on Group release notifications.
+    std::string channelFullPolicy{"fail_fast"};
+    std::uint32_t busyFloor{32};
+    std::uint64_t stableSuccessMs{60000};
+    std::uint32_t maxInflightPerChannel{256};
+    std::uint32_t connectRetryPerRound{0};
+    std::uint64_t recoverInitialBackoffMs{100};
+    std::uint64_t recoverMaxBackoffMs{5000};
+    std::string selectionPolicy{"round_robin"};
     std::size_t completionPollSpinLimit{16};
 
     bool enableDeviceDirect{true};

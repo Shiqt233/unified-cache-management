@@ -99,6 +99,10 @@ Status TransportTaskExecutor::PrepareTaskSubBatches(
         }
     } else if (IsKeepAliveOp(ctx.opType)) {
         auto& subBatchContext = subBatchContexts.emplace_back();
+        subBatchContext.currentAttempt.channel = ctx.targetChannel;
+        subBatchContext.currentAttempt.generation = ctx.targetGeneration;
+        subBatchContext.retryState.preferredChannel = ctx.targetChannel;
+        subBatchContext.currentAttempt.state = AttemptState::SENDING;
         const auto subBatchStatus = SubmitKeepAliveRequest(subBatchContext);
         if (!subBatchStatus.ok()) {
             KV_ERROR("Submit keep-alive request failed code={} message={}",
@@ -119,6 +123,7 @@ void TransportTaskExecutor::BuildSubBatchSendBuffers(
     ioBatches.reserve(subBatchContexts.size());
 
     for (auto& subBatchContext : subBatchContexts) {
+        if (subBatchContext.currentAttempt.state == AttemptState::FLOW_WAIT) { continue; }
         ioBatches.push_back(TransProvider::SendIoBatch{
             subBatchContext.channel->GetConnection(),
             reinterpret_cast<void*>(subBatchContext.sendSge.device_addr),

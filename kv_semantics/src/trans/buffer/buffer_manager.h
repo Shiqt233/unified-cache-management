@@ -58,6 +58,10 @@ public:
 
     Status Allocate(std::size_t size, ScatterGatherEntry& sge);
     Status Free(std::uint32_t slot_index);
+    // Keep an allocated slot out of the free list until an explicit safe release.
+    Status Quarantine(std::uint32_t slot_index);
+    Status ReleaseQuarantined(std::uint32_t slot_index);
+    bool IsQuarantined(std::uint32_t slot_index) const;
 
     bool IsValidPointer(const void* ptr) const;
 

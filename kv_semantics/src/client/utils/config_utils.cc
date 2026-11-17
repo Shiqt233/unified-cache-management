@@ -238,6 +238,10 @@ Status KvClientConfig::LoadFromFile(const std::string& configPath, KvClientConfi
             if (ApplyTransportDeviceConfigField(transportConfig, field.first, field.second)) {
                 continue;
             }
+            const auto retryStatus = ApplyTransportRetryConfigField(transportConfig, field.first,
+                                                                    field.second);
+            if (retryStatus.ok()) { continue; }
+            if (retryStatus.code != StatusCode::UNSUPPORTED) { return retryStatus; }
             if (field.first == "maxErrorCount" || field.first == "max_error_count") {
                 transportConfig.maxErrorCount =
                     static_cast<std::uint32_t>(ParseConfigUint64(field.second));

@@ -356,7 +356,7 @@ TEST(AsuSubmitFlowTest, SendSubBatchBuffersReadsSendCountsFromAttrs)
     EXPECT_TRUE(subBatchContexts[0].status.ok());
 }
 
-TEST(AsuSubmitFlowTest, AbortBeforeSendPreservesStatusesBeforeFailureAndCancelsFollowing)
+TEST(AsuSubmitFlowTest, AbortBeforeSendMarksUnsentEntriesInProgressAndCancelsFollowing)
 {
     AsuTransportImpl transport;
     transport.SetTransProvider(std::make_unique<StubTransProvider>());
@@ -373,14 +373,14 @@ TEST(AsuSubmitFlowTest, AbortBeforeSendPreservesStatusesBeforeFailureAndCancelsF
     task.entryStatus.assign(3, Status::OK());
     transport.taskExecutor_->AbortSubBatchesBeforeSend(task, subBatchContexts);
 
-    EXPECT_TRUE(subBatchContexts[0].status.ok());
-    EXPECT_TRUE(subBatchContexts[0].entryStatus[0].ok());
+    EXPECT_EQ(subBatchContexts[0].status.code, StatusCode::IN_PROGRESS);
+    EXPECT_EQ(subBatchContexts[0].entryStatus[0].code, StatusCode::IN_PROGRESS);
     EXPECT_EQ(subBatchContexts[1].status.code, StatusCode::INTERNAL_ERROR);
     EXPECT_EQ(subBatchContexts[1].entryStatus[0].code, StatusCode::INTERNAL_ERROR);
     EXPECT_EQ(subBatchContexts[2].status.code, StatusCode::CANCELED);
     EXPECT_EQ(subBatchContexts[2].entryStatus[0].code, StatusCode::CANCELED);
     for (const auto& entryStatus : task.entryStatus) {
-        EXPECT_EQ(entryStatus.code, StatusCode::CANCELED);
+        EXPECT_EQ(entryStatus.code, StatusCode::IN_PROGRESS);
     }
     for (const auto& subBatchContext : subBatchContexts) {
         EXPECT_EQ(subBatchContext.state, TransportSubBatchState::COMPLETED);

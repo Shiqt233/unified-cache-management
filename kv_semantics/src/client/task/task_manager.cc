@@ -111,6 +111,8 @@ Status ClientTaskManager::Wait(TaskId taskId, std::uint64_t waitTimeoutMs, TaskR
     if (!task) { return Status::Error(StatusCode::TASK_NOT_FOUND, "task not found"); }
 
     auto status = WaitContext(task, waitTimeoutMs, result);
+    // Preserve the existing contract: Wait consumes the ClientTask even on timeout.
+    // WaitContext also marks queued and in-flight work canceled so no new attempt starts.
     (void)Remove(taskId);
     return status;
 }
@@ -136,10 +138,20 @@ Status ClientTaskManager::Process(const ClientTaskPtr& task)
     if (!task) {
         return Status::Error(StatusCode::INVALID_ARGUMENT, "client task context is null");
     }
+    if (task->cancelRequested.load(std::memory_order_acquire)) {
+        const auto status = Status::Error(StatusCode::CANCELED, "client task canceled before processing");
+        CompleteWithError(task, status);
+        return status;
+    }
     task->state.store(ClientTaskState::INFLIGHT, std::memory_order_release);
 
     auto status = BuildTransportTasks(task);
     if (!status.ok()) {
+        CompleteWithError(task, status);
+        return status;
+    }
+    if (task->cancelRequested.load(std::memory_order_acquire)) {
+        const auto status = Status::Error(StatusCode::CANCELED, "client task canceled before dispatch");
         CompleteWithError(task, status);
         return status;
     }
@@ -165,6 +177,9 @@ void ClientTaskManager::CompleteWithError(const ClientTaskPtr& task, const Statu
     task->cv.notify_all();
 }
 
+// Restore each TransportTask result to its original client-entry position. A
+// TransportTask may contain a different order after routing/subBatch splitting;
+// originalIndices, rather than response arrival order, defines the public order.
 void ClientTaskManager::CompleteTransportTask(const ClientTaskPtr& task,
                                               std::size_t transportTaskIndex, TaskResult result)
 {
@@ -227,6 +242,9 @@ void ClientTaskManager::CompleteUndispatchedTransportTasks(const ClientTaskPtr& 
     if (task->AllTransportTasksCompleted()) { Finalize(task); }
 }
 
+// Aggregate final TransportTask results. Any failed TransportTask produces
+// PARTIAL_FAILED; otherwise preserve the existing OK compatibility behavior for
+// ordinary Entry errors. This method only reports results and never starts a retry.
 void ClientTaskManager::Finalize(const ClientTaskPtr& task)
 {
     if (task->opType == AsuOpType::QUERY) {
@@ -251,9 +269,10 @@ void ClientTaskManager::Finalize(const ClientTaskPtr& task)
             itemCount, static_cast<int>(transportTask->finalStatus.code),
             transportTask->finalStatus.message);
     }
-    task->finalStatus = failedTransportTasks == 0 ? Status::OK()
-                                                  : Status::Error(StatusCode::PARTIAL_FAILED,
-                                                                  "client task partially failed");
+    task->finalStatus = failedTransportTasks == 0
+                            ? Status::OK()
+                            : Status::Error(StatusCode::PARTIAL_FAILED,
+                                            "client task partially failed");
     RecordClientTaskCompletion(*task);
     if (task->finalStatus.ok()) {
         KV_DEBUG("ASU client task completed: client_task_id={} op={} transport_tasks={}.",
@@ -265,6 +284,7 @@ void ClientTaskManager::Finalize(const ClientTaskPtr& task)
 
 Status ClientTaskManager::BuildTransportTasks(const ClientTaskPtr& task)
 {
+    std::lock_guard<std::mutex> taskLock(task->waitMu);
     auto snapshot = task->viewSnapshot;
     if (!snapshot || !snapshot->router || snapshot->transports.empty()) {
         return Status::Error(StatusCode::NOT_INITIALIZED, "client has no ASU transports");
@@ -284,6 +304,7 @@ Status ClientTaskManager::BuildTransportTasks(const ClientTaskPtr& task)
     task->transportTasks.reserve(routes.size());
     for (const auto& [nodeId, indices] : routes) {
         auto transportTask = std::make_shared<TransportTask>();
+        transportTask->clientTask = task;
         transportTask->nodeId = nodeId;
         transportTask->transport = snapshot->transports.at(nodeId);
         transportTask->originalIndices.reserve(indices.size());
@@ -311,6 +332,11 @@ Status ClientTaskManager::BuildTransportTasks(const ClientTaskPtr& task)
 
 Status ClientTaskManager::DispatchTask(const ClientTaskPtr& task)
 {
+    if (task->cancelRequested.load(std::memory_order_acquire)) {
+        const auto status = Status::Error(StatusCode::CANCELED, "client task canceled before dispatch");
+        CompleteUndispatchedTransportTasks(task, 0, status);
+        return status;
+    }
     if (task->transportTasks.empty()) {
         std::lock_guard<std::mutex> lock(task->waitMu);
         Finalize(task);
@@ -318,6 +344,11 @@ Status ClientTaskManager::DispatchTask(const ClientTaskPtr& task)
     }
 
     for (std::size_t taskIndex = 0; taskIndex < task->transportTasks.size(); ++taskIndex) {
+        if (task->cancelRequested.load(std::memory_order_acquire)) {
+            const auto status = Status::Error(StatusCode::CANCELED, "client task canceled during dispatch");
+            CompleteUndispatchedTransportTasks(task, taskIndex, status);
+            return status;
+        }
         auto& transportTask = task->transportTasks[taskIndex];
         auto transport = transportTask->transport.lock();
 
@@ -363,6 +394,9 @@ Status ClientTaskManager::BuildResult(const ClientTaskPtr& task, TaskResult& res
     return result.status;
 }
 
+// A Client Wait timeout consumes the caller-visible task and prevents new attempts.
+// It still does not prove that already-issued hardware IO has stopped; quarantine
+// protects memory until the transport reaches its safe cleanup point.
 Status ClientTaskManager::WaitContext(const ClientTaskPtr& task, std::uint64_t waitTimeoutMs,
                                       TaskResult& result)
 {
@@ -371,6 +405,14 @@ Status ClientTaskManager::WaitContext(const ClientTaskPtr& task, std::uint64_t w
     std::unique_lock<std::mutex> lock(task->waitMu);
     const bool done = task->cv.wait_for(lock, std::chrono::milliseconds(waitTimeoutMs),
                                         [task] { return task->Done(); });
+    if (!done) {
+        task->cancelRequested.store(true, std::memory_order_release);
+        for (const auto& transportTask : task->transportTasks) {
+            if (transportTask != nullptr) {
+                transportTask->cancelRequested.store(true, std::memory_order_release);
+            }
+        }
+    }
     BuildResult(task, result);
     if (!done) {
         result.status = Status::Error(

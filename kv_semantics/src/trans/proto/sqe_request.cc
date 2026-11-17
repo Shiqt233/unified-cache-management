@@ -30,6 +30,7 @@
 #include <utility>
 #include <vector>
 #include "buffer/buffer_manager.h"
+#include "conn/connection_internal.h"
 #include "conn/connection_manager.h"
 #include "kv_protocol.h"
 #include "logger.h"
@@ -128,6 +129,12 @@ Status PrepareSubBatchRequest(AsuOpType opType, KvOpcode opcode, std::uint16_t c
 {
     subBatchContext.opType = opType;
     subBatchContext.cid = cid;
+    subBatchContext.currentAttempt.requestCid = cid;
+    if (cid == 0) {
+        const auto status = Status::Error(StatusCode::RESOURCE_BUSY, "request CID space exhausted");
+        SetSubBatchBuildFailed(subBatchContext, status);
+        return status;
+    }
     auto status = AllocateSubBatchFlagBuffer(opcode, batchNum, flagBufferManager, subBatchContext);
     if (!status.ok()) {
         SetSubBatchBuildFailed(subBatchContext, status);
@@ -166,6 +173,9 @@ Status PackSubBatchRequest(ProtocolManager& protocolManager, BufferManager& send
     return status;
 }
 
+// Build protocol metadata only. The request retains the source buffer address/MR;
+// it does not snapshot the payload bytes. offset is the target key's write offset,
+// while buffer_length and length are both derived from region.size in this client.
 KvBatchStoreRequest BuildBatchStoreRequest(
     const BatchView<KVBuffer>& entries, const std::unordered_map<std::string, std::string>& attrs,
     std::uint16_t cid, const ScatterGatherEntry& flagBuffer)
@@ -193,6 +203,9 @@ KvBatchStoreRequest BuildBatchStoreRequest(
     return request;
 }
 
+// Single-Store request fields mirror the source buffer metadata. The current
+// builder sets buffer_length=length=region.size; there is no independent slot
+// capacity or written-range snapshot in this public KVBuffer representation.
 KvStoreRequest BuildStoreRequest(const KVBuffer& entry,
                                  const std::unordered_map<std::string, std::string>& attrs,
                                  std::uint16_t cid)
@@ -369,8 +382,13 @@ Status TransportTaskExecutor::BuildEntrySubBatchRequest(
 
     auto request = BuildSqeRequest(opcode, source, config_.attrs, subBatchContext.cid,
                                    subBatchContext.flagBuffer, subBatchContext);
-    return PackSubBatchRequest(protocolManager_, sendBufferManager_, opcode, *request,
-                               subBatchContext);
+    if (!request) {
+        return Status::Error(StatusCode::INTERNAL_ERROR, "failed to build SQE request");
+    }
+    subBatchContext.request = std::move(request);
+    subBatchContext.currentAttempt.request = subBatchContext.request;
+    return PackSubBatchRequest(protocolManager_, sendBufferManager_, opcode,
+                               *subBatchContext.request, subBatchContext);
 }
 
 Status TransportTaskExecutor::SubmitKeySubBatchRequest(
@@ -387,8 +405,13 @@ Status TransportTaskExecutor::SubmitKeySubBatchRequest(
 
     auto request = BuildSqeRequest(opcode, source, config_.attrs, subBatchContext.cid,
                                    subBatchContext.flagBuffer, subBatchContext);
-    return PackSubBatchRequest(protocolManager_, sendBufferManager_, opcode, *request,
-                               subBatchContext);
+    if (!request) {
+        return Status::Error(StatusCode::INTERNAL_ERROR, "failed to build SQE request");
+    }
+    subBatchContext.request = std::move(request);
+    subBatchContext.currentAttempt.request = subBatchContext.request;
+    return PackSubBatchRequest(protocolManager_, sendBufferManager_, opcode,
+                               *subBatchContext.request, subBatchContext);
 }
 
 Status TransportTaskExecutor::SubmitKeepAliveRequest(TransportSubBatchContext& subBatchContext)
@@ -404,8 +427,201 @@ Status TransportTaskExecutor::SubmitKeepAliveRequest(TransportSubBatchContext& s
 
     auto request = BuildSqeRequest(opcode, source, config_.attrs, subBatchContext.cid,
                                    subBatchContext.flagBuffer, subBatchContext);
-    return PackSubBatchRequest(protocolManager_, sendBufferManager_, opcode, *request,
-                               subBatchContext);
+    if (!request) {
+        return Status::Error(StatusCode::INTERNAL_ERROR, "failed to build SQE request");
+    }
+    subBatchContext.request = std::move(request);
+    subBatchContext.currentAttempt.request = subBatchContext.request;
+    return PackSubBatchRequest(protocolManager_, sendBufferManager_, opcode,
+                               *subBatchContext.request, subBatchContext);
+}
+
+namespace {
+
+std::uint32_t GetSendCountAttr(const std::unordered_map<std::string, std::string>& attrs,
+                               const std::string& name)
+{
+    auto it = attrs.find(name);
+    if (it == attrs.end()) { return 0; }
+    return static_cast<std::uint32_t>(std::stoull(it->second, nullptr, 0));
+}
+
+// Clone only the protocol request object and its Entry metadata. Payload bytes
+// remain in the caller's registered buffer, so a retry is identical only if that
+// buffer remains alive and unmodified for the whole retry lifetime.
+std::shared_ptr<SqeRequest> CloneSqeRequest(const SqeRequest& request, KvOpcode opcode)
+{
+    switch (opcode) {
+        case KvOpcode::Store:
+            return std::make_shared<KvStoreRequest>(static_cast<const KvStoreRequest&>(request));
+        case KvOpcode::Retrieve:
+            return std::make_shared<KvRetrieveRequest>(static_cast<const KvRetrieveRequest&>(request));
+        case KvOpcode::BatchStore:
+            return std::make_shared<KvBatchStoreRequest>(static_cast<const KvBatchStoreRequest&>(request));
+        case KvOpcode::BatchRetrieve:
+            return std::make_shared<KvBatchRetrieveRequest>(static_cast<const KvBatchRetrieveRequest&>(request));
+        case KvOpcode::Delete:
+            return std::make_shared<KvDeleteRequest>(static_cast<const KvDeleteRequest&>(request));
+        case KvOpcode::Exist:
+            return std::make_shared<KvExistRequest>(static_cast<const KvExistRequest&>(request));
+        case KvOpcode::KeepAlive:
+            return std::make_shared<KvKeepAliveRequest>(static_cast<const KvKeepAliveRequest&>(request));
+        default:
+            return nullptr;
+    }
+}
+
+void UpdateRequestForAttempt(SqeRequest& request, KvOpcode opcode, std::uint16_t cid,
+                             const ScatterGatherEntry& flagBuffer)
+{
+    switch (opcode) {
+        case KvOpcode::Store:
+            static_cast<KvStoreRequest&>(request).cid = cid;
+            break;
+        case KvOpcode::Retrieve:
+            static_cast<KvRetrieveRequest&>(request).cid = cid;
+            break;
+        case KvOpcode::BatchStore: {
+            auto& typed = static_cast<KvBatchStoreRequest&>(request);
+            typed.cid = cid;
+            typed.response_buffer_addr = flagBuffer.device_addr;
+            typed.response_mr_key = flagBuffer.tokenId;
+            break;
+        }
+        case KvOpcode::BatchRetrieve: {
+            auto& typed = static_cast<KvBatchRetrieveRequest&>(request);
+            typed.cid = cid;
+            typed.response_buffer_addr = flagBuffer.device_addr;
+            typed.response_mr_key = flagBuffer.tokenId;
+            break;
+        }
+        case KvOpcode::Delete: {
+            auto& typed = static_cast<KvDeleteRequest&>(request);
+            typed.cid = cid;
+            typed.response_buffer_addr = flagBuffer.device_addr;
+            typed.response_mr_key = flagBuffer.tokenId;
+            break;
+        }
+        case KvOpcode::Exist: {
+            auto& typed = static_cast<KvExistRequest&>(request);
+            typed.cid = cid;
+            typed.response_buffer_addr = flagBuffer.device_addr;
+            typed.response_mr_key = flagBuffer.tokenId;
+            break;
+        }
+        case KvOpcode::KeepAlive: {
+            auto& typed = static_cast<KvKeepAliveRequest&>(request);
+            typed.cid = cid;
+            typed.response_buffer_addr = flagBuffer.device_addr;
+            typed.response_mr_key = flagBuffer.tokenId;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+}  // namespace
+
+// Rebuild one attempt from the immutable original subBatch template. The new
+// attempt gets fresh send/flag slots and a new CID/response binding; the original
+// request is not mutated and no Entry subset is selected for retry.
+Status TransportTaskExecutor::PrepareRetryRequest(TransportSubBatchContext& subBatchContext)
+{
+    if (!subBatchContext.request) {
+        return Status::Error(StatusCode::INTERNAL_ERROR, "missing original SQE request for retry");
+    }
+    subBatchContext.currentAttempt.request =
+        CloneSqeRequest(*subBatchContext.request, ToKvOpcode(subBatchContext.opType));
+    if (!subBatchContext.currentAttempt.request) {
+        return Status::Error(StatusCode::INTERNAL_ERROR, "failed to clone SQE request for retry");
+    }
+
+    const auto opcode = ToKvOpcode(subBatchContext.opType);
+    auto status = PrepareSubBatchRequest(subBatchContext.opType, opcode,
+                                         subBatchContext.currentAttempt.requestCid,
+                                         subBatchContext.entryStatus.size(), flagBufferManager_,
+                                         subBatchContext);
+    if (!status.ok()) { return status; }
+
+    UpdateRequestForAttempt(*subBatchContext.currentAttempt.request, opcode,
+                            subBatchContext.currentAttempt.requestCid, subBatchContext.flagBuffer);
+    return PackSubBatchRequest(protocolManager_, sendBufferManager_, opcode,
+                               *subBatchContext.currentAttempt.request, subBatchContext);
+}
+
+// Send exactly one attempt. Provider failures retain PROVIDER_SEND as their
+// origin; a MAYBE_SENT failure is not automatically evidence that no write occurred.
+Status TransportTaskExecutor::SendSingleAttempt(TransportSubBatchContext& subBatchContext)
+{
+    if (!subBatchContext.channel) {
+        return Status::Error(StatusCode::CONNECTION_ERROR, "no channel for retry attempt");
+    }
+    const auto kernelCount = GetSendCountAttr(config_.attrs, "kernel_count");
+    const auto quietCount = GetSendCountAttr(config_.attrs, "quiet_count");
+    const std::vector<TransProvider::SendIoBatch> ioBatches = {
+        TransProvider::SendIoBatch{
+            subBatchContext.channel->GetConnection(),
+            reinterpret_cast<void*>(subBatchContext.sendSge.device_addr),
+            reinterpret_cast<void*>(subBatchContext.flagBuffer.device_addr),
+            subBatchContext.sendSge.length,
+        },
+    };
+    subBatchContext.currentAttempt.sendAttempted = true;
+    auto statuses = transProvider_->Send(ioBatches, kernelCount, quietCount);
+    if (statuses.size() != 1) {
+        return Status::Error(StatusCode::INTERNAL_ERROR,
+                             "transport retry send returned unexpected status count");
+    }
+    return statuses.front();
+}
+
+void TransportTaskExecutor::SendSubBatchBuffers(
+    TransportTask& task, const std::vector<TransProvider::SendIoBatch>& ioBatches)
+{
+    if (ioBatches.empty()) { return; }
+
+    for (auto& subBatchContext : *task.subBatchContexts) {
+        if (subBatchContext.currentAttempt.state != AttemptState::FLOW_WAIT &&
+            subBatchContext.currentAttempt.state != AttemptState::COMPLETED) {
+            subBatchContext.currentAttempt.sendAttempted = true;
+        }
+    }
+    const auto kernelCount = GetSendCountAttr(config_.attrs, "kernel_count");
+    const auto quietCount = GetSendCountAttr(config_.attrs, "quiet_count");
+    const auto sendStartedAt = std::chrono::steady_clock::now();
+    const auto sendStatuses = transProvider_->Send(ioBatches, kernelCount, quietCount);
+    metrics::UpdateStats(
+        KV_METRIC("kv_transport_task_send_call_duration_seconds"),
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - sendStartedAt).count());
+    if (sendStatuses.size() != ioBatches.size()) {
+        const auto status = Status::Error(StatusCode::INTERNAL_ERROR,
+                                          "transport send returned unexpected status count");
+        for (auto& subBatchContext : *task.subBatchContexts) {
+            if (subBatchContext.currentAttempt.state == AttemptState::FLOW_WAIT ||
+                subBatchContext.currentAttempt.state == AttemptState::COMPLETED) {
+                continue;
+            }
+            (void)HandleAttemptFailure(task, subBatchContext, status, ErrorOrigin::PROVIDER_SEND);
+        }
+        return;
+    }
+
+    std::size_t sendIndex = 0;
+    for (auto& subBatchContext : *task.subBatchContexts) {
+        if (subBatchContext.currentAttempt.state == AttemptState::FLOW_WAIT ||
+            subBatchContext.currentAttempt.state == AttemptState::COMPLETED) {
+            continue;
+        }
+        if (sendIndex >= sendStatuses.size()) { break; }
+        const auto& subBatchStatus = sendStatuses[sendIndex++];
+        if (subBatchStatus.ok()) {
+            subBatchContext.currentAttempt.state = AttemptState::WAITING_RESPONSE;
+            subBatchContext.status = Status::Error(StatusCode::IN_PROGRESS, "attempt in progress");
+            continue;
+        }
+        (void)HandleAttemptFailure(task, subBatchContext, subBatchStatus, ErrorOrigin::PROVIDER_SEND);
+    }
 }
 
 }  // namespace kv

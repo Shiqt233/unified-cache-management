@@ -45,7 +45,12 @@ public:
     // Submits asynchronous reads into the supplied buffers and returns a task ID.
     virtual Status LoadAsync(const std::vector<KVBuffer>& entries, TaskId& taskId) = 0;
     // Submits asynchronous writes from the supplied buffers after the optional prerequisite
-    // callback. Runs prerequisite on the Client worker before dispatch. Empty means no
+    // callback. STORE follows a create-and-fill state machine: an absent key is created and
+    // written; an existing key may be overwritten only while its range is not full; a full key
+    // rejects the write with CQE_KEY_ALREADY_EXISTED. OK confirms acceptance of this write,
+    // not necessarily completion of the key's full range. The source buffer and MR must remain
+    // valid and unmodified until every attempt has finished, including any retry or late response.
+    // Runs prerequisite on the Client worker before dispatch. Empty means no
     // prerequisite. Return a failure to complete the task without sending; exceptions become
     // INTERNAL_ERROR. The callback runs once and may block subsequent tasks. It must set any
     // required device context and keep captured events/streams alive until it returns.

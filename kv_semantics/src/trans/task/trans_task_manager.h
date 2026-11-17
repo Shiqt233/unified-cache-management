@@ -26,14 +26,67 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <vector>
 #include "buffer/buffer_manager.h"
 #include "conn/connection_manager.h"
 #include "kv_transport.h"
 #include "task_context.h"
 #include "task_manager_base.h"
+#include "task/error_classifier.h"
 
 namespace kv {
+
+class SqeRequest;
+
+// State of one send attempt. RETRY_BACKOFF means another attempt may still be
+// scheduled; it is not the final completion state of the owning subBatch.
+enum class AttemptState : std::uint8_t {
+    READY,
+    SENDING,
+    WAITING_RESPONSE,
+    FLOW_WAIT,
+    RETRY_BACKOFF,
+    COMPLETED,
+    CANCELLED,
+};
+
+struct MRLifecycleLease {
+    MRHandle canonicalHandle{kInvalidMRHandle};
+    std::set<MRHandle> handles;
+    std::uint32_t refCount{0};
+    bool quarantined{false};
+    bool unregisterRequested{false};
+};
+
+struct AttemptContext {
+    std::uint64_t attemptId{0};
+    std::uint16_t requestCid{0};
+    std::uint64_t generation{0};
+    AttemptState state{AttemptState::READY};
+    std::chrono::steady_clock::time_point deadline{std::chrono::steady_clock::time_point::max()};
+    bool sendAttempted{false};
+    bool responseConfirmed{false};
+    std::shared_ptr<ConnectionChannel> channel;
+    std::shared_ptr<ConnectionGroup> group;
+    std::shared_ptr<MRLifecycleLease> mrLease;
+    std::shared_ptr<SqeRequest> request;
+};
+
+struct SubBatchRetryState {
+    std::uint32_t busyAttempts{0};
+    std::uint32_t failoverAttempts{0};
+    std::set<ConnectionAttemptKey> attemptedGenerations;
+    std::shared_ptr<ConnectionChannel> preferredChannel;
+    Status lastError{Status::OK()};
+    RetryAction retryAction{RetryAction::RETURN_RESULT};
+    bool retryPending{false};
+    std::chrono::steady_clock::time_point retryAt{std::chrono::steady_clock::time_point::min()};
+    AcquireCode flowWaitReason{AcquireCode::OK};
+    std::shared_ptr<ConnectionGroup> flowWaitGroup;
+    std::set<std::uint32_t> quarantinedSendSlots;
+    std::set<std::uint32_t> quarantinedFlagSlots;
+};
 
 struct TransportSubBatchContext {
     std::uint16_t cid{0};
@@ -45,6 +98,10 @@ struct TransportSubBatchContext {
     ScatterGatherEntry sendSge;
     ScatterGatherEntry flagBuffer;
     std::vector<Status> entryStatus;
+    // Original request template. Each retry clones it into currentAttempt.request.
+    std::shared_ptr<SqeRequest> request;
+    AttemptContext currentAttempt;
+    SubBatchRetryState retryState;
 };
 
 void FillEntryStatusFromCqeResult(const KvResponse& response,

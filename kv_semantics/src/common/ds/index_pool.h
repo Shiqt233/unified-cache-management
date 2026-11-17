@@ -27,6 +27,8 @@
 #include <atomic>
 #include <cstddef>
 #include <limits>
+#include <mutex>
+#include <unordered_set>
 #include <vector>
 
 namespace kv {
@@ -49,10 +51,15 @@ private:
 public:
     void Setup(const Index capacity) noexcept
     {
+        std::lock_guard<std::mutex> lock(quarantineMu_);
         this->capacity_ = capacity;
         this->nodes_.resize(capacity + 1);
+        allocated_.reserve(capacity);
+        quarantined_.reserve(capacity);
         for (Index slot = 1; slot <= capacity; ++slot) { this->nodes_[slot].next = slot + 1; }
         this->nodes_[capacity].next = 0;
+        allocated_.clear();
+        quarantined_.clear();
         this->pointer_.store({1, 0});
     }
     Index Acquire() noexcept
@@ -64,13 +71,22 @@ public:
             Pointer desired{next, ptr.ver + 1};
             if (this->pointer_.compare_exchange_weak(ptr, desired, std::memory_order_release,
                                                      std::memory_order_relaxed)) {
-                return ptr.slot - 1;
+                const auto index = ptr.slot - 1;
+                std::lock_guard<std::mutex> lock(quarantineMu_);
+                allocated_.insert(index);
+                return index;
             }
         }
     }
     void Release(const Index idx) noexcept
     {
         if (idx >= this->capacity_) { return; }
+        std::lock_guard<std::mutex> lock(quarantineMu_);
+        // A quarantined slot stays allocated and is not returned to the free list.
+        if (quarantined_.find(idx) != quarantined_.end() ||
+            allocated_.find(idx) == allocated_.end()) {
+            return;
+        }
         auto slot = idx + 1;
         for (;;) {
             auto ptr = this->pointer_.load(std::memory_order_acquire);
@@ -78,15 +94,50 @@ public:
             Pointer desired{slot, ptr.ver + 1};
             if (this->pointer_.compare_exchange_weak(ptr, desired, std::memory_order_release,
                                                      std::memory_order_relaxed)) {
+                allocated_.erase(idx);
                 return;
             }
         }
     }
 
+    bool Quarantine(const Index idx) noexcept
+    {
+        if (idx >= this->capacity_) { return false; }
+        std::lock_guard<std::mutex> lock(quarantineMu_);
+        if (allocated_.find(idx) == allocated_.end()) { return false; }
+        quarantined_.insert(idx);
+        return true;
+    }
+
+    bool ReleaseQuarantined(const Index idx) noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(quarantineMu_);
+            if (quarantined_.erase(idx) == 0) { return false; }
+        }
+        Release(idx);
+        return true;
+    }
+
+    bool IsQuarantined(const Index idx) const noexcept
+    {
+        std::lock_guard<std::mutex> lock(quarantineMu_);
+        return quarantined_.find(idx) != quarantined_.end();
+    }
+
+    bool IsAllocated(const Index idx) const noexcept
+    {
+        std::lock_guard<std::mutex> lock(quarantineMu_);
+        return allocated_.find(idx) != allocated_.end();
+    }
+
 private:
-    Index capacity_;
+    Index capacity_{0};
     std::vector<Node> nodes_;
     alignas(64) std::atomic<Pointer> pointer_;
+    mutable std::mutex quarantineMu_;
+    std::unordered_set<Index> allocated_;
+    std::unordered_set<Index> quarantined_;
 };
 
 }  // namespace kv

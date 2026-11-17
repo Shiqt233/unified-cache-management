@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include "kv_client_impl.h"
+#include "probe_scheduler.h"
 #include <algorithm>
 #include <chrono>
 #include <exception>
@@ -129,6 +130,10 @@ Status KvClientImpl::Init(const KvClientConfig& config)
         return Status::Error(StatusCode::INVALID_ARGUMENT,
                              "at least one transport config is required");
     }
+    for (const auto& transportConfig : config.transportConfigs) {
+        const auto probeStatus = ValidateProbeConfig(transportConfig);
+        if (!probeStatus.ok()) { return probeStatus; }
+    }
     const auto queueDepth =
         std::max<std::size_t>(2, static_cast<std::size_t>(config.maxInflightTasks));
 
@@ -158,11 +163,17 @@ Status KvClientImpl::Init(const KvClientConfig& config)
         return status;
     }
 
+    probeScheduler_ = std::make_unique<ClientProbeScheduler>(BuildProbeConfig());
+    for (const auto& item : nextSnapshot->transports) {
+        probeScheduler_->RegisterTransport(item.second);
+    }
+
     taskQueue_.Setup(queueDepth + 1);
     stopWorker_.store(false, std::memory_order_release);
     worker_ = std::thread(&KvClientImpl::WorkerLoop, this);
     snapshot_ = std::move(nextSnapshot);
     initialized_ = true;
+    probeScheduler_->Start();
     return Status::OK();
 }
 
@@ -181,6 +192,7 @@ Status KvClientImpl::Shutdown()
     workerCv_.notify_one();
     JoinBackgroundRefresh();
     if (worker_.joinable()) { worker_.join(); }
+    if (probeScheduler_) { probeScheduler_->Stop(); }
 
     std::shared_ptr<ViewSnapshot> snapshot;
     std::vector<std::shared_ptr<AsuTransport>> retiredTransports;
@@ -212,6 +224,7 @@ Status KvClientImpl::Shutdown()
         auto status = transport->Shutdown();
         if (!status.ok() && finalStatus.ok()) { finalStatus = status; }
     }
+    probeScheduler_.reset();
     const auto unregisterState = [this, &finalStatus](const ProviderMemoryState& state) {
         std::vector<MRHandle> localHandles;
         localHandles.reserve(state.regionHandles.size());
@@ -421,11 +434,10 @@ Status KvClientImpl::SubmitAsync(AsuOpType opType, const std::vector<KVBuffer>& 
             auto iter = registeredRegions_.find(entry.buffer.handle);
             if (iter != registeredRegions_.end()) { entry.mrKey = iter->second.tokenId; }
         }
+        ctx->entryStatus.assign(entries.size(), Status::OK());
+        auto status = taskManager_.Submit(std::move(ctx), taskId);
+        if (!status.ok()) { return status; }
     }
-    ctx->entryStatus.assign(entries.size(), Status::OK());
-
-    auto status = taskManager_.Submit(std::move(ctx), taskId);
-    if (!status.ok()) { return status; }
 
     auto rawCtx = taskManager_.Get(taskId);
     if (!rawCtx) {
@@ -545,12 +557,50 @@ void KvClientImpl::WorkerLoop()
 
 Status KvClientImpl::UnregisterRegions(const std::vector<MRHandle>& handles)
 {
+    std::vector<std::shared_ptr<AsuTransport>> transports;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (snapshot_) {
+            for (const auto& item : snapshot_->transports) { transports.push_back(item.second); }
+        }
+        transports.insert(transports.end(), retiredTransports_.begin(), retiredTransports_.end());
+    }
+
     std::lock_guard<std::mutex> memoryLock{memoryMu_};
     std::vector<MRHandle> canonicalHandles;
     canonicalHandles.reserve(handles.size());
     for (auto handle : handles) {
         if (handle == kInvalidMRHandle) { continue; }
         if (registeredRegions_.count(handle) != 0) { canonicalHandles.emplace_back(handle); }
+    }
+
+    const auto hasInflight = [this, &transports](MRHandle handle) {
+        for (const auto& task : taskManager_.GetAll()) {
+            if (!task || (task->Done() && task->finalStatus.ok())) { continue; }
+            std::lock_guard<std::mutex> taskLock(task->waitMu);
+            for (const auto& entry : task->entries) {
+                if (entry.buffer.handle == handle) { return true; }
+            }
+            for (const auto& transportTask : task->transportTasks) {
+                if (!transportTask || (transportTask->Done() && transportTask->finalStatus.ok())) {
+                    continue;
+                }
+                for (const auto& entry : transportTask->entries) {
+                    if (entry.buffer.handle == handle) { return true; }
+                }
+            }
+        }
+        for (const auto& transport : transports) {
+            if (transport && transport->HasInflightMemory(handle)) { return true; }
+        }
+        return false;
+    };
+
+    for (auto handle : canonicalHandles) {
+        if (hasInflight(handle)) {
+            return Status::Error(StatusCode::RESOURCE_BUSY,
+                                 "memory region has in-flight IO and cannot be unregistered");
+        }
     }
 
     Status finalStatus = Status::OK();
@@ -593,6 +643,34 @@ Status KvClientImpl::UnregisterRegions(const std::vector<MRHandle>& handles)
         return WithContext(finalStatus, "handle_count=" + std::to_string(canonicalHandles.size()));
     }
     return finalStatus;
+}
+
+TransportConfig KvClientImpl::BuildProbeConfig() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    TransportConfig result;
+    bool hasEnabledTransport = false;
+    for (const auto& item : transportConfigs_) {
+        const auto& current = item.second;
+        if (!current.probeEnabled) { continue; }
+        if (!hasEnabledTransport) {
+            result = current;
+            hasEnabledTransport = true;
+            continue;
+        }
+        result.probeEnabled = true;
+        result.probePeriodMs = std::min(result.probePeriodMs, current.probePeriodMs);
+        result.probeMaxInflight = std::min(result.probeMaxInflight, current.probeMaxInflight);
+        result.probeMaxSubmissionsPerRound =
+            std::min(result.probeMaxSubmissionsPerRound, current.probeMaxSubmissionsPerRound);
+        result.probeTransportScanBudget =
+            std::min(result.probeTransportScanBudget, current.probeTransportScanBudget);
+        result.probeChannelScanBudgetPerTransport =
+            std::min(result.probeChannelScanBudgetPerTransport,
+                     current.probeChannelScanBudgetPerTransport);
+        result.probeTimeoutMs = std::min(result.probeTimeoutMs, current.probeTimeoutMs);
+    }
+    return result;
 }
 
 Status KvClientImpl::BuildSnapshot(const GlobalView& view,
@@ -820,9 +898,17 @@ Status KvClientImpl::RefreshView()
         if (snapshot_ != nullptr && !viewServer->ShouldPublishView(snapshot_->view, view)) {
             return Status::OK();
         }
+        if (probeScheduler_) {
+            for (const auto& item : nextSnapshot->transports) {
+                probeScheduler_->RegisterTransport(item.second);
+            }
+        }
         if (oldSnapshot != nullptr) {
             for (const auto& item : oldSnapshot->transports) {
                 if (nextSnapshot->transports.find(item.first) == nextSnapshot->transports.end()) {
+                    if (probeScheduler_) {
+                        probeScheduler_->UnregisterTransport(item.second.get());
+                    }
                     retiredTransports_.emplace_back(item.second);
                 }
             }
