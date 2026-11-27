@@ -31,7 +31,9 @@
 //   F4 三态         ∈ {GREEN, YELLOW, RED} × {updating=true/false}
 //   F5 UpdateGroups ∈ {fail-fast, 删除无匹配, 删除有匹配, 新增, 全等skip,
 //                       属性替换, 部分失败, 重复推送}
-//   F6 异步 UpdateGroups ∈ {worker 完成, fail-fast 无副作用, 严格 FIFO,
+//   F6 选路         ∈ {排除集跨Group优先, 同Group兜底, 排空无候选,
+//                       原链重试复用, 满载拒绝}
+//   F7 异步 UpdateGroups ∈ {worker 完成, fail-fast 无副作用, 严格 FIFO,
 //                             分摊公平(恢复穿插), 关停取消, updating 跨 tick,
 //                             同步包装, 内联回退}
 // 断言面：状态迁移、句柄删除恰好一次、计数器清零、窗口标志、三态聚合、
@@ -671,6 +673,137 @@ TEST(ConnectionUpdateGroupsTest, UpdatingFlagVisibleDuringWindowOnly)
     EXPECT_FALSE(after.updating);
     EXPECT_EQ(after.health, NodeHealth::GREEN);
 }
+
+// ─── F6: 选路（排除集 / 原链重试） ───
+
+TEST(ConnectionSelectionTest, FailoverPrefersCrossGroupThenSameGroup)
+{
+    ScriptedTransProvider provider;
+    ConnectionManager mgr(provider, "");
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint("10.0.0.1"), 2).ok());
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint("10.0.0.2"), 2).ok());
+
+    // 收集全部 Channel 身份。
+    std::vector<std::shared_ptr<ConnectionChannel>> all;
+    for (int i = 0; i < 4; ++i) {
+        auto channel = mgr.SelectConnection();
+        ASSERT_NE(channel, nullptr);
+        all.push_back(channel);
+    }
+    for (auto& channel : all) { channel->ReleaseInflight(); }
+    ASSERT_EQ(all.size(), std::size_t{4});
+
+    // 排除组0的第一条：剩余候选 = 组1（跨Group）+ 组0第二链（同Group兜底），
+    // 两级优先：优先返回跨 Group 的候选。
+    std::set<std::uint32_t> crossGroupPicks;
+    for (int round = 0; round < 8; ++round) {
+        auto pick = mgr.SelectConnection({all[0].get()});
+        ASSERT_NE(pick, nullptr);
+        EXPECT_NE(pick.get(), all[0].get());
+        crossGroupPicks.insert(pick->GetGroupId());
+        pick->ReleaseInflight();
+    }
+    // 跨组候选必须出现（组1 可选）。
+    EXPECT_TRUE(crossGroupPicks.count(1) != 0);
+
+    // 排除整个组0：只能返回组1。
+    auto crossOnly = mgr.SelectConnection({all[0].get(), all[1].get()});
+    ASSERT_NE(crossOnly, nullptr);
+    EXPECT_EQ(crossOnly->GetGroupId(), std::uint32_t{1});
+    crossOnly->ReleaseInflight();
+}
+
+TEST(ConnectionSelectionTest, FailoverExcludesAttemptedChannelsByObjectIdentity)
+{
+    ScriptedTransProvider provider;
+    ConnectionManager mgr(provider, "");
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint("10.0.0.1"), 1).ok());
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint("10.0.0.2"), 1).ok());
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint("10.0.0.3"), 1).ok());
+
+    auto first = mgr.SelectConnection();
+    ASSERT_NE(first, nullptr);
+    first->ReleaseInflight();
+
+    // 排除 first：跨 Group 优先——不得返回 first 本身，也不得返回同组其它链路
+    //（该组只有 first 一条）。
+    auto second = mgr.SelectConnection({first.get()});
+    ASSERT_NE(second, nullptr);
+    EXPECT_NE(second.get(), first.get());
+    EXPECT_NE(second->GetGroupId(), first->GetGroupId());
+    second->ReleaseInflight();
+
+    // 排除集按对象身份去重：同一 Channel 重复排除不扩大候选。
+    auto none = mgr.SelectConnection({first.get(), first.get(), second.get()});
+    ASSERT_NE(none, nullptr);
+    EXPECT_NE(none.get(), first.get());
+    EXPECT_NE(none.get(), second.get());
+    none->ReleaseInflight();
+}
+
+TEST(ConnectionSelectionTest, FailoverSameGroupFallbackWhenNoCrossGroupLeft)
+{
+    ScriptedTransProvider provider;
+    ConnectionManager mgr(provider, "");
+    // 单组双 Channel：排除其一时同组兜底。
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint("10.0.0.1"), 2).ok());
+
+    auto ch0 = mgr.SelectConnection();
+    auto ch1 = mgr.SelectConnection();
+    ASSERT_NE(ch0, nullptr);
+    ASSERT_NE(ch1, nullptr);
+    ch0->ReleaseInflight();
+    ch1->ReleaseInflight();
+
+    auto fallback = mgr.SelectConnection({ch0.get()});
+    ASSERT_NE(fallback, nullptr);
+    EXPECT_EQ(fallback->GetGroupId(), ch0->GetGroupId());  // 同组兜底
+    EXPECT_NE(fallback.get(), ch0.get());
+    fallback->ReleaseInflight();
+
+    // 排空所有候选：fail-fast 无候选。
+    EXPECT_EQ(mgr.SelectConnection({ch0.get(), ch1.get()}), nullptr);
+}
+
+TEST(ConnectionSelectionTest, AcquireChannelReusesSameActiveChannel)
+{
+    ScriptedTransProvider provider;
+    ConnectionManager mgr(provider, "");
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint("10.0.0.1"), 2).ok());
+
+    auto channel = mgr.SelectConnection();
+    ASSERT_NE(channel, nullptr);
+    channel->ReleaseInflight();
+    const auto inflightBefore = channel->GetInflightCount();
+
+    // 原链重试：不重置 channel 字段（返回同一对象），inflight+1。
+    auto reacquired = mgr.AcquireChannel(channel);
+    ASSERT_NE(reacquired, nullptr);
+    EXPECT_EQ(reacquired.get(), channel.get());
+    EXPECT_EQ(channel->GetInflightCount(), inflightBefore + 1);
+    channel->ReleaseInflight();
+
+    // 非 ACTIVE 的原链不可重试：fail-fast。
+    channel->MarkForDrain();
+    EXPECT_EQ(mgr.AcquireChannel(channel), nullptr);
+}
+
+TEST(ConnectionSelectionTest, AcquireChannelRejectsAtPerChannelInflightLimit)
+{
+    ScriptedTransProvider provider;
+    provider.serverCapabilities.ioQueueDepth = 1;  // 能力收紧 per-channel 上限
+    ConnectionManager mgr(provider, "");
+    ASSERT_TRUE(mgr.AddGroup(MakeEndpoint("10.0.0.1"), 1).ok());
+
+    auto channel = mgr.SelectConnection();
+    ASSERT_NE(channel, nullptr);
+    EXPECT_EQ(channel->GetInflightCount(), 1u);  // 已达上限
+    EXPECT_EQ(mgr.AcquireChannel(channel), nullptr);
+    EXPECT_EQ(mgr.SelectConnection(), nullptr);
+}
+
+// ─── 并发 DT ───
+
 
 // ─── 并发 DT ───
 
