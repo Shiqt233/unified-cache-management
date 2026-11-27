@@ -61,7 +61,7 @@ ConnectionManager::ConnectionManager(TransProvider& provider, const std::string&
       connectRetryPerRound_(config.recovery.connectRetryPerRound),
       recoverInitialBackoffMs_(config.recovery.recoverInitialBackoffMs),
       recoverMaxBackoffMs_(config.recovery.recoverMaxBackoffMs),
-      taskTimeoutMs_(config.timeoutMs),
+      taskTimeoutMs_(config.retry.taskTimeoutMs),
       qpNum_(config.qpNum),
       deviceId_(config.deviceId)
 {
@@ -196,22 +196,77 @@ Status ConnectionManager::Shutdown()
     return Status::OK();
 }
 
-std::shared_ptr<ConnectionChannel> ConnectionManager::SelectConnection()
+std::shared_ptr<ConnectionChannel> ConnectionManager::SelectConnection(
+    const std::vector<ConnectionChannel*>& excludedChannels)
 {
     if (shuttingDown_.load(std::memory_order_acquire)) { return nullptr; }
-    auto policy = routingPolicy_;
-    auto channel =
-        policy == RoutingPolicy::LEAST_LOADED ? SelectByLeastLoaded() : SelectByRoundRobin();
-    if (channel) {
-        KV_DEBUG("ConnectionManager::SelectConnection policy={} ch_id={} group_id={} inflight={}",
-                 policy == RoutingPolicy::LEAST_LOADED ? "LEAST_LOADED" : "ROUND_ROBIN",
-                 channel->GetChannelId(), channel->GetGroup()->GetGroupId(),
-                 channel->GetInflightCount());
-    } else {
-        KV_DEBUG("ConnectionManager::SelectConnection policy={} NO available channel",
-                 policy == RoutingPolicy::LEAST_LOADED ? "LEAST_LOADED" : "ROUND_ROBIN");
+
+    std::vector<std::shared_ptr<ConnectionChannel>> candidates;
+    if (excludedChannels.empty()) {
+        auto channel = routingPolicy_ == RoutingPolicy::LEAST_LOADED ? SelectByLeastLoaded()
+                                                                      : SelectByRoundRobin();
+        if (channel) {
+            KV_DEBUG("ConnectionManager::SelectConnection ch_id={} group_id={} inflight={}",
+                     channel->GetChannelId(), channel->GetGroup()->GetGroupId(),
+                     channel->GetInflightCount());
+        }
+        return channel;
     }
-    return channel;
+
+    // Two-level failover preference: channels in groups outside the excluded
+    // channels' groups first, then same-group non-excluded channels as the
+    // fallback. Exclusion itself uses channel object identity.
+    std::vector<std::uint32_t> excludedGroups;
+    for (const auto* channel : excludedChannels) {
+        if (channel == nullptr) { continue; }
+        excludedGroups.push_back(channel->GetGroup()->GetGroupId());
+    }
+
+    {
+        std::lock_guard<std::mutex> cacheLock(channelCacheMu_);
+        if (cacheDirty_.load(std::memory_order_acquire)) { RebuildChannelCache(); }
+        std::vector<std::shared_ptr<ConnectionChannel>> crossGroup;
+        std::vector<std::shared_ptr<ConnectionChannel>> sameGroup;
+        for (const auto& channel : channelCache_) {
+            if (channel->GetState() != ChannelState::ACTIVE) { continue; }
+            if (std::find(excludedChannels.begin(), excludedChannels.end(), channel.get()) !=
+                excludedChannels.end()) {
+                continue;
+            }
+            const bool groupExcluded = std::find(excludedGroups.begin(), excludedGroups.end(),
+                                                 channel->GetGroup()->GetGroupId()) != excludedGroups.end();
+            if (groupExcluded) {
+                sameGroup.push_back(channel);
+            } else {
+                crossGroup.push_back(channel);
+            }
+        }
+        candidates = std::move(crossGroup);
+        candidates.insert(candidates.end(), std::make_move_iterator(sameGroup.begin()),
+                         std::make_move_iterator(sameGroup.end()));
+    }
+
+    auto selected = SelectByPolicyLocked(candidates);
+    if (selected) {
+        KV_DEBUG("ConnectionManager::SelectConnection failover ch_id={} group_id={} "
+                 "excluded={}",
+                 selected->GetChannelId(), selected->GetGroup()->GetGroupId(), excludedChannels.size());
+    } else {
+        KV_DEBUG("ConnectionManager::SelectConnection failover NO available channel "
+                 "excluded={}",
+                 excludedChannels.size());
+    }
+    return selected;
+}
+
+std::shared_ptr<ConnectionChannel> ConnectionManager::AcquireChannel(
+    const std::shared_ptr<ConnectionChannel>& preferred)
+{
+    if (shuttingDown_.load(std::memory_order_acquire)) { return nullptr; }
+    if (!preferred || preferred->GetState() != ChannelState::ACTIVE) { return nullptr; }
+    if (preferred->GetInflightCount() >= maxInflightPerChannel_) { return nullptr; }
+    preferred->IncrementInflight();
+    return preferred;
 }
 
 std::shared_ptr<ConnectionChannel> ConnectionManager::GetActiveConnection()

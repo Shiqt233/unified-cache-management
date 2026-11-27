@@ -225,6 +225,22 @@ struct ConnectionConfig {
     Status Validate() const;
 };
 
+// Per-attempt retry routing knobs. busyRetryCount (M) bounds same-channel busy
+// retries and failoverRetryCount (N) bounds link-failure failovers. The k-th
+// busy backoff is min(busyRetryBackoffMaxMs, busyRetryBackoffBaseMs * 2^(k-1));
+// failover and ENTRY_RETRY_ADVISED retries switch channels immediately without
+// backoff and without jitter.
+struct RetryConfig {
+    std::uint32_t busyRetryCount{2};  // M, valid range 0..16
+    std::uint32_t busyRetryBackoffBaseMs{1};
+    std::uint32_t busyRetryBackoffMaxMs{100};
+    std::uint32_t failoverRetryCount{2};  // N, valid range 0..16
+    std::uint64_t taskTimeoutMs{100};     // > 0, task total deadline
+    std::uint32_t attemptTimeoutMs{100};  // > 0, per-attempt deadline is
+                                          // min(attemptTimeoutMs, remaining)
+    Status Validate() const;
+};
+
 struct NodeEndpoint {
     std::string ip;
     std::uint16_t port{0};
@@ -263,7 +279,7 @@ struct TransportConfig {
     // illegal values return INVALID_ARGUMENT instead of silent fallback).
     RecoveryConfig recovery;
     ConnectionConfig connection;
-
+    RetryConfig retry;
     bool enableDeviceDirect{true};
     bool enableHostFallback{false};
     bool preconnect{true};

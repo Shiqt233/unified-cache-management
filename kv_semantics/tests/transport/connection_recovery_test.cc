@@ -157,7 +157,7 @@ TransportConfig FastRecoveryConfig()
     config.recovery.recoverInitialBackoffMs = 5;
     config.recovery.recoverMaxBackoffMs = 20;
     config.recovery.connectRetryPerRound = 1;  // 每轮 1+1=2 次尝试
-    config.timeoutMs = 20;  // 任务超时（legacy 字段，恢复排空上界的一部分）
+    config.retry.taskTimeoutMs = 20;  // 任务总超时（RetryConfig，排空上界的一部分）
     config.connection.maxErrorCount = 1;
     return config;
 }

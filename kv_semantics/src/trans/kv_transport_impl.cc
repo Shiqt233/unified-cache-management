@@ -80,9 +80,9 @@ Status AsuTransportImpl::Init(const TransportConfig& config,
     }
     // Structured connection-reliability sections: illegal values are rejected
     // with INVALID_ARGUMENT instead of silent fallback.
+    if (auto status = config_.retry.Validate(); !status.ok()) { return status; }
     if (auto status = config_.recovery.Validate(); !status.ok()) { return status; }
     if (auto status = config_.connection.Validate(); !status.ok()) { return status; }
-
     if (!transProvider_) {
         KV_ERROR("AsuTransportImpl::Init: TransProvider is null");
         return Status::Error(StatusCode::NOT_INITIALIZED, "TransProvider is null");
@@ -93,9 +93,7 @@ Status AsuTransportImpl::Init(const TransportConfig& config,
     if (it != config_.attrs.end()) { localIp = it->second; }
 
     connManager_.reset();
-    connManager_ = std::make_unique<ConnectionManager>(*transProvider_, localIp, config_);
-
-    const std::uint32_t qp_num = config_.qpNum;
+    connManager_ = std::make_unique<ConnectionManager>(*transProvider_, localIp, config_);    const std::uint32_t qp_num = config_.qpNum;
     KV_DEBUG("AsuTransportImpl::Init endpoints={} qp_num={}", config_.endpoints.size(), qp_num);
     for (const auto& ep : config_.endpoints) {
         auto s = connManager_->AddGroup(ep, qp_num);
@@ -264,7 +262,9 @@ Status AsuTransportImpl::Submit(const TransportTaskPtr& task)
     if (!task) { return Status::Error(StatusCode::INVALID_ARGUMENT, "transport task is null"); }
     const auto entryCount = IsEntryBatchOp(task->opType) ? task->entries.size() : task->keys.size();
     task->entryStatus.assign(entryCount, Status::OK());
-    task->deadline = TaskDeadline(config_.timeoutMs);
+    // The task total deadline comes from the structured RetryConfig section;
+    // the client Wait timeout is a separate concept.
+    task->deadline = TaskDeadline(config_.retry.taskTimeoutMs);
     return SubmitTask(task);
 }
 
@@ -342,6 +342,8 @@ void AsuTransportImpl::CompletionLoop()
 
         bool completedTask = false;
         for (const auto& ctx : tasks) {
+            // RETRY_BACKOFF 驱动：非阻塞，禁止在共享线程内 sleep 退避。
+            if (taskExecutor_->HasRetryWork(ctx)) { taskExecutor_->ExecuteRetry(ctx); }
             if (taskExecutor_->Poll(ctx)) {
                 taskManager_.NotifyCompletion(ctx);
                 completedTask = true;
